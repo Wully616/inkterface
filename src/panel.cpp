@@ -123,9 +123,9 @@ void Panel::onServiceStateChanged(QLowEnergyService::ServiceState state)
     qDebug() << "Found " << m_service->characteristics().count() << "characteristics!";
     m_sendTimer->start(250);
     m_lastComms = std::chrono::steady_clock::now();
-    // if a game is already being played, make sure the fresh connection
-    // gets the artwork frame too
-    queueArtworkFrame();
+    // reconcile the panel to our desired state: re-send a running game's frame,
+    // or clear a panel that may be stuck showing stale artwork
+    reconcileArtwork();
 }
 
 void Panel::onServiceError(QLowEnergyService::ServiceError error)
@@ -153,6 +153,7 @@ void Panel::onArtworkFrame(QByteArray bits, quint16 width, quint16 height)
     m_pendingArtBits = bits;
     m_pendingArtWidth = width;
     m_pendingArtHeight = height;
+    m_artworkActive = true;
     queueArtworkFrame();
 }
 
@@ -161,6 +162,12 @@ void Panel::onArtworkClear()
     m_pendingArtBits.clear();
     m_pendingArtWidth = 0;
     m_pendingArtHeight = 0;
+    m_artworkActive = false;
+    sendArtworkClear();
+}
+
+void Panel::sendArtworkClear()
+{
     m_artQueue.clear();
     m_artSending = false;
     if (!m_service || m_service->state() != QLowEnergyService::RemoteServiceDiscovered) {
@@ -170,6 +177,19 @@ void Panel::onArtworkClear()
     if (c.isValid()) {
         m_artQueue.append(QByteArray(1, char(0x03)));
         sendArtwork();
+    }
+}
+
+void Panel::reconcileArtwork()
+{
+    // a fresh connection may be to a panel that is stuck in artwork mode (e.g.
+    // a clear was dropped while disconnected), so always assert our intent:
+    // re-send the active frame, or clear. The firmware ignores a clear when it
+    // is already showing telemetry, so an idle reconcile costs nothing.
+    if (m_artworkActive && !m_pendingArtBits.isEmpty()) {
+        queueArtworkFrame();
+    } else {
+        sendArtworkClear();
     }
 }
 

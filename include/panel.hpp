@@ -75,8 +75,14 @@ class Panel : public QObject
     QByteArray m_pendingArtBits;
     quint16 m_pendingArtWidth = 0;
     quint16 m_pendingArtHeight = 0;
+    // desired display state, so a (re)connected panel is always reconciled:
+    // when a game is running we re-send its frame, otherwise we send a clear
+    // in case the panel is stuck in artwork mode from a dropped clear
+    bool m_artworkActive = false;
 
     void queueArtworkFrame();
+    void sendArtworkClear();
+    void reconcileArtwork();
     void sendArtwork();
 };
 
