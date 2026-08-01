@@ -421,9 +421,14 @@ class ArtworkCallbacks : public NimBLECharacteristicCallbacks
             break;
         }
         case 0x03: {
-            Debug.println("leaving artwork mode");
-            STATE.artMode = false;
-            DISP_DEBOUNCE = 100;
+            // only redraw if we were actually showing artwork, so the host can
+            // safely re-assert a clear on every reconnect without flashing a
+            // panel that is already showing telemetry
+            if (STATE.artMode) {
+                Debug.println("leaving artwork mode");
+                STATE.artMode = false;
+                DISP_DEBOUNCE = 100;
+            }
             break;
         }
         default: {
@@ -463,7 +468,9 @@ void setup()
 
     Debug.println("setting up ble device and service");
     NimBLEDevice::init("");
-    NimBLEDevice::setPower(2); // we don't need much power
+    // the panel magnets to a metal chassis that shields the host's BT antenna,
+    // so use a healthy TX power; +9 dBm is the safe max on both feather boards
+    NimBLEDevice::setPower(9);
     NimBLEDevice::setMTU(256); // bump the mtu to fit a decent number of points
     BLE_SERVER = NimBLEDevice::createServer();
     BLE_SERVER->setCallbacks(&SERVER_CALLBACKS);
@@ -519,12 +526,23 @@ void setup()
     name << std::uppercase << std::hex << std::setfill('0') << std::setw(6) << addr;
     BLE_NAME = name.str();
     BLEAdvertising *advert = NimBLEDevice::getAdvertising();
+    // A BLE advertisement payload is capped at 31 bytes. Flags + the name +
+    // our manufacturer data (the interface version the app uses to decide the
+    // panel is "supported") come to ~26 bytes and fit. Adding the 128-bit
+    // service UUID (18 bytes) overflows the packet, and on newer BlueZ stacks
+    // (e.g. SteamOS 3.8.x) that overflow drops the manufacturer data, so the
+    // app never sees the version and marks the panel UNSUPPORTED. Keep the
+    // name + version in the primary advertisement and move the UUID into the
+    // scan response, which has its own 31-byte budget.
     BLEAdvertisementData ad_data{};
     ad_data.setName(BLE_NAME);
     ad_data.setManufacturerData("\x5d\x05" INTERFACE_VERSION);
     advert->setAdvertisementData(ad_data);
-    advert->addServiceUUID(SERVICE_UUID);
-    advert->enableScanResponse(false);
+
+    BLEAdvertisementData scan_data{};
+    scan_data.addServiceUUID(SERVICE_UUID);
+    advert->setScanResponseData(scan_data);
+    advert->enableScanResponse(true);
     NimBLEDevice::startAdvertising();
 
 #if defined(GABEN_STARTUP)
@@ -798,6 +816,17 @@ void drawArt()
     int16_t x = (MF_DISPLAY.width() - STATE.artWidth) / 2;
     int16_t y = (MF_DISPLAY.height() - STATE.artHeight) / 2;
     MF_DISPLAY.drawBitmap(x, y, ART_BUFFER, STATE.artWidth, STATE.artHeight, FG_COLOR);
+
+    // keep the firmware version visible even in artwork mode; draw it on a
+    // small solid swatch so it stays readable over dark box art
+    std::stringstream tag;
+    tag << GIT_REVISION << " " << INTERFACE_VERSION;
+    std::string tagstr = tag.str();
+    int16_t tw = 6 * (int16_t)tagstr.length();
+    int16_t tx = 4;
+    int16_t ty = MF_DISPLAY.height() - 12;
+    MF_DISPLAY.fillRect(tx - 2, ty - 2, tw + 4, 11, BG_COLOR);
+    drawText(tagstr.c_str(), tx, ty);
 } // }}}
 
 void drawLowBatt()
