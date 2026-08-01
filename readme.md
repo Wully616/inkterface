@@ -38,6 +38,15 @@ system telemetry readouts.
 Achievement data comes from the Steam Community profile endpoint and requires
 no API key, but your profile's game details need to be public for it to show.
 
+## Known issues
+
+* **A game's box art can stay "stuck" on the panel after you quit it.** Some
+  titles (DREDGE is a known one) leave a background process running under
+  Proton, so Steam still reports the game as active even though you're back in
+  the library — the panel faithfully keeps showing its art. Restarting Steam
+  (or the machine) clears the leftover process and the panel returns to normal.
+  Most games quit cleanly; this only affects the few that linger.
+
 ## Quick Install (this fork)
 
 **Firmware** — plug the Feather into any PC over USB and open the
