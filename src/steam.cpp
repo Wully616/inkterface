@@ -34,32 +34,46 @@ QString Steam::steamDir()
     return result;
 }
 
-QString Steam::currentUser(bool account_name)
-{
-    QString result;
-    QVariantMap loginusers = loadVDF(steamDir() + "/config/loginusers.vdf");
-    const auto users = loginusers.value("users").toMap();
-    for (auto &user : users) {
-        if (user.toMap().value("MostRecent").value<QByteArray>() == "1"_ba) {
-            result = user.toMap().value(account_name ? "AccountName" : "PersonaName").toString();
-            break;
-        }
-    }
-    return result;
-}
-
 QString Steam::currentUserId()
 {
-    QString result;
-    QVariantMap loginusers = loadVDF(steamDir() + "/config/loginusers.vdf");
-    const auto users = loginusers.value("users").toMap();
+    // Pick the account most likely to be the active one. Steam dropped the
+    // "MostRecent" flag from loginusers.vdf in a mid-2026 client update (which
+    // silently broke playtime + achievements here), so we can't rely on it:
+    // prefer MostRecent when present for older clients, then AutoLogin, then the
+    // newest Timestamp, and fall back to the sole account when there's only one.
+    const QVariantMap loginusers = loadVDF(steamDir() + "/config/loginusers.vdf");
+    const QVariantMap users = vdfGet(loginusers, {u"users"_s}).toMap();
+
+    QString bestId;
+    int bestRank = -1;
+    qint64 bestTs = -1;
     for (auto it = users.cbegin(), end = users.cend(); it != end; ++it) {
-        if (it.value().toMap().value("MostRecent").value<QByteArray>() == "1"_ba) {
-            result = it.key();
-            break;
+        const QVariantMap u = it.value().toMap();
+        int rank = 0;
+        if (vdfGet(u, {u"MostRecent"_s}).toString() == u"1"_s) {
+            rank = 2;
+        } else if (vdfGet(u, {u"AutoLogin"_s}).toString() == u"1"_s) {
+            rank = 1;
+        }
+        const qint64 ts = vdfGet(u, {u"Timestamp"_s}).toString().toLongLong();
+        if (rank > bestRank || (rank == bestRank && ts > bestTs)) {
+            bestRank = rank;
+            bestTs = ts;
+            bestId = it.key();
         }
     }
-    return result;
+    return bestId;
+}
+
+QString Steam::currentUser(bool account_name)
+{
+    const QString id = currentUserId();
+    if (id.isEmpty()) {
+        return {};
+    }
+    const QVariantMap loginusers = loadVDF(steamDir() + "/config/loginusers.vdf");
+    const QVariantMap u = vdfGet(loginusers, {u"users"_s, id}).toMap();
+    return vdfGet(u, {account_name ? u"AccountName"_s : u"PersonaName"_s}).toString();
 }
 
 QVariant Steam::vdfGet(const QVariantMap &map, const QStringList &path)
@@ -339,6 +353,27 @@ QString Steam::parseVDF(const QByteArray &data, QVariantMap &output)
     return {};
 }
 
+QString Steam::runningAppId()
+{
+    // Steam records the currently running app under
+    // HKCU/Software/Valve/Steam/RunningAppID in registry.vdf ("0" when idle).
+    // This lives alongside the .steam dir, not inside the steam install dir.
+    const QString path = QDir::homePath() + u"/.steam/registry.vdf"_s;
+    if (!QFile::exists(path)) {
+        return {};
+    }
+    const QVariantMap reg = loadVDF(path);
+    if (reg.isEmpty()) {
+        return {};
+    }
+    const QVariant v = vdfGet(reg, {u"Registry"_s, u"HKCU"_s, u"Software"_s, u"Valve"_s,
+                                    u"Steam"_s, u"RunningAppID"_s});
+    if (!v.isValid()) {
+        return {};
+    }
+    return v.toString();
+}
+
 void Steam::watchConsoleLog(bool start)
 {
     if (!start && (m_consoleLog == nullptr || !m_consoleLog->isOpen())) {
@@ -393,6 +428,31 @@ void Steam::watchConsoleLog(bool start)
     if (appChanged) {
         getAppDetails(lastAppId, !m_runningApp.appid.isEmpty(),
                       m_runningApp.appid.isEmpty() && !lastAppId.isEmpty());
+    }
+
+    // Authoritative cross-check against registry.vdf so a missed console-log
+    // line (e.g. a SteamOS format change) can't leave us stuck believing a
+    // game is running - the symptom behind the box-art-stuck-after-quit bug.
+    const QString regRaw = runningAppId();
+    if (!regRaw.isNull()) {
+        const QString reg = regRaw.isEmpty() ? u"0"_s : regRaw;
+        const QString cur = m_runningApp.appid.isEmpty() ? u"0"_s : m_runningApp.appid;
+        if (reg == cur) {
+            m_regDisagreeStreak = 0;
+        } else if (++m_regDisagreeStreak >= 3) {
+            m_regDisagreeStreak = 0;
+            if (reg == u"0"_s) {
+                qDebug() << "registry.vdf shows no running app, clearing stuck" << cur;
+                const QString stopped = m_runningApp.appid;
+                m_runningApp.clear();
+                getAppDetails(stopped, false, true);
+            } else {
+                qDebug() << "registry.vdf shows running app" << reg << "adopting over" << cur;
+                m_runningApp.clear();
+                m_runningApp.appid = reg;
+                getAppDetails(reg, true, false);
+            }
+        }
     }
 
     // "[2025-10-06 12:19:18] CAPIJobRequestUserStats - Server response failed 2\r\n"

@@ -45,6 +45,11 @@ class Steam : public QObject
     QVariantMap loadVDF(const QString &path);
     QString parseVDF(const QByteArray &data, QVariantMap &output);
 
+    // the app Steam currently has running, read authoritatively from
+    // registry.vdf; returns "0" when nothing is running and a null QString
+    // when the registry can't be read/parsed (so callers can fall back)
+    QString runningAppId();
+
     const App &runningApp() const { return m_runningApp; }
 
   public slots:
@@ -70,6 +75,9 @@ class Steam : public QObject
     QMap<QString, QPair<int, int>> m_achievementCache;
 
     App m_runningApp;
+    // consecutive polls where registry.vdf disagreed with m_runningApp; we
+    // only trust the registry after a few in a row to avoid launch-time races
+    int m_regDisagreeStreak = 0;
 
     // walks nested QVariantMaps by key, matching keys case-insensitively
     // since valve's VDF files are inconsistent about casing
