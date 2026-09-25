@@ -29,16 +29,17 @@
   <h1>Inkterface Firmware Flasher</h1>
   <p>
     Flash the <a href="https://gitlab.steamos.cloud/SteamHardware/SteamMachine/inkterface">Inkterface</a>
-    e-ink faceplate firmware straight from your browser &mdash; no tools to install.
+    display firmware straight from your browser &mdash; no tools to install.
   </p>
   <ol>
-    <li>Plug your Feather board into this computer over USB.</li>
+    <li>Plug a supported board into this computer over USB.</li>
     <li>Click the install button for your board below.</li>
     <li>Pick the board's serial port in the popup and follow the prompts.</li>
   </ol>
   <p class="muted">
     Requires Chrome or Edge (browsers with Web Serial support). If the board
-    doesn't show up, hold its BOOT/DFU button while plugging it in.
+    doesn't show up, hold BOOT while connecting USB, then release it. After
+    flashing the Waveshare board, press RESET to start the firmware.
   </p>
 
   <div class="board">
@@ -51,6 +52,12 @@
     <h2>Adafruit Feather ESP32 V2 (Feather V2 build)</h2>
     <p class="muted">The older plain-ESP32 Feather, USB-C, CH9102 serial chip.</p>
     <esp-web-install-button manifest="manifest_featherv2.json"></esp-web-install-button>
+  </div>
+
+  <div class="board">
+    <h2>Waveshare ESP32-S3-LCD-5B (N16R8)</h2>
+    <p class="muted">5-inch ST7262 RGB display, 1024×600, 16 MB flash and 8 MB PSRAM.</p>
+    <esp-web-install-button manifest="manifest_lcd5b.json"></esp-web-install-button>
   </div>
 
   <p class="muted">

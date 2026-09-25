@@ -8,6 +8,10 @@
 #include "panel-finder.hpp"
 #include "panel-state.hpp"
 
+static constexpr int EINK_SEND_INTERVAL_MS = 30000;
+// PanelState samples telemetry every 2 seconds; send once per sample on the LCD.
+static constexpr int LCD5B_SEND_INTERVAL_MS = 2000;
+
 class Panel : public QObject
 {
     Q_OBJECT
@@ -36,7 +40,8 @@ class Panel : public QObject
   private slots:
     void connCheck();
     void sendState();
-    void onArtworkFrame(QByteArray bits, quint16 width, quint16 height);
+    void onArtworkFrame(QByteArray monoBits, quint16 monoWidth, quint16 monoHeight,
+                        QByteArray colorJpeg, quint16 colorWidth, quint16 colorHeight);
     void onArtworkClear();
 
     void clearConnection();
@@ -58,6 +63,7 @@ class Panel : public QObject
 
     QTimer *m_connTimer = nullptr;
     QTimer *m_sendTimer = nullptr;
+    int m_sendInterval = EINK_SEND_INTERVAL_MS;
     bool m_connecting = false;
     bool m_stopping = false;
     std::chrono::time_point<std::chrono::steady_clock> m_lastComms;
@@ -75,6 +81,9 @@ class Panel : public QObject
     QByteArray m_pendingArtBits;
     quint16 m_pendingArtWidth = 0;
     quint16 m_pendingArtHeight = 0;
+    QByteArray m_pendingColorArtJpeg;
+    quint16 m_pendingColorArtWidth = 0;
+    quint16 m_pendingColorArtHeight = 0;
     // desired display state, so a (re)connected panel is always reconciled:
     // when a game is running we re-send its frame, otherwise we send a clear
     // in case the panel is stuck in artwork mode from a dropped clear

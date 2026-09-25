@@ -420,8 +420,9 @@ class PanelState : public QObject
     void fieldsChanged();
     void collectorsChanged();
     void artworkEnabledChanged();
-    // a composed 1bpp frame ready to be pushed to the panel
-    void artworkFrame(QByteArray bits, quint16 width, quint16 height);
+    // E-paper gets its compact 1bpp frame; LCD-5B gets a native-size JPEG.
+    void artworkFrame(QByteArray monoBits, quint16 monoWidth, quint16 monoHeight,
+                      QByteArray colorJpeg, quint16 colorWidth, quint16 colorHeight);
     // the panel should fall back to the telemetry layout
     void artworkClear();
 

@@ -1,0 +1,11 @@
+{
+  "name": "Inkterface (Waveshare ESP32-S3-LCD-5B)",
+  "version": "latest",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [{ "path": "inkterface-lcd5b.bin", "offset": 0 }]
+    }
+  ]
+}

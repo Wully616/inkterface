@@ -7,9 +7,12 @@
 
 #include "steam.hpp"
 
-// the e-ink panel resolution, frames are always composed at full size
+// The e-paper panels use the original 648x480 monochrome frame. The LCD-5B
+// gets a separate full-resolution JPEG frame so its artwork stays in color.
 #define ART_FRAME_WIDTH 648
 #define ART_FRAME_HEIGHT 480
+#define LCD_ART_FRAME_WIDTH 1024
+#define LCD_ART_FRAME_HEIGHT 600
 
 class Artwork : public QObject
 {
@@ -28,7 +31,8 @@ class Artwork : public QObject
     void composeForApp(const steam::App &app, double playtimeMinutes, QPair<int, int> achievements);
 
   signals:
-    void frameReady(QByteArray bits, quint16 width, quint16 height);
+    void frameReady(QByteArray monoBits, quint16 monoWidth, quint16 monoHeight,
+                    QByteArray colorJpeg, quint16 colorWidth, quint16 colorHeight);
 
   private slots:
     void boxArtReply();
@@ -49,6 +53,7 @@ class Artwork : public QObject
 
     QImage loadLocalBoxArt(const QString &appid);
     void compose();
+    QByteArray composeColorJpeg() const;
 };
 
 #endif /* ARTWORK_HPP */

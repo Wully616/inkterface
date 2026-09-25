@@ -4,6 +4,7 @@ include/config.h
 *AppDir/
 *AppImage
 *.tar.gz
+web/inkterface-*.bin
 .pio/
 sdkconfig.*
 !sdkconfig.defaults*

@@ -27,32 +27,39 @@ jobs:
       - name: Install PlatformIO and esptool
         run: pip install platformio esptool
 
-      - name: Build both board variants
+      - name: Build all board variants
         working-directory: firmware
         run: |
-          pio run -e featherv1 -e featherv2
+          pio run -e featherv1 -e featherv2 -e lcd5b
 
       - name: Merge flashable images
         working-directory: firmware
         run: |
           BOOT_APP0=$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin
           # feather v1 is an esp32-s3, bootloader lives at 0x0
-          python -m esptool --chip esp32s3 merge_bin -o inkterface-featherv1.bin \
+          python -m esptool --chip esp32s3 merge-bin -o inkterface-featherv1.bin \
             0x0 .pio/build/featherv1/bootloader.bin \
             0x8000 .pio/build/featherv1/partitions.bin \
             0xe000 "$BOOT_APP0" \
             0x10000 .pio/build/featherv1/firmware.bin
           # feather v2 is a classic esp32, bootloader lives at 0x1000
-          python -m esptool --chip esp32 merge_bin -o inkterface-featherv2.bin \
+          python -m esptool --chip esp32 merge-bin -o inkterface-featherv2.bin \
             0x1000 .pio/build/featherv2/bootloader.bin \
             0x8000 .pio/build/featherv2/partitions.bin \
             0xe000 "$BOOT_APP0" \
             0x10000 .pio/build/featherv2/firmware.bin
+          # Waveshare LCD-5B is an ESP32-S3 with 16 MB QIO flash.
+          python -m esptool --chip esp32s3 merge-bin --flash-mode qio --flash-size 16MB \
+            -o inkterface-lcd5b.bin \
+            0x0 .pio/build/lcd5b/bootloader.bin \
+            0x8000 .pio/build/lcd5b/partitions.bin \
+            0xe000 "$BOOT_APP0" \
+            0x10000 .pio/build/lcd5b/firmware.bin
 
       - uses: actions/upload-artifact@v4
         with:
           name: firmware
-          path: firmware/inkterface-feather*.bin
+          path: firmware/inkterface-*.bin
 
   appimage:
     name: Build AppImage
@@ -110,6 +117,7 @@ jobs:
             Inkterface.AppImage
             inkterface-featherv1.bin
             inkterface-featherv2.bin
+            inkterface-lcd5b.bin
 
   pages:
     name: Deploy web flasher

@@ -1,6 +1,7 @@
 #include "artwork.hpp"
 
 #include <QDebug>
+#include <QBuffer>
 #include <QDir>
 #include <QFont>
 #include <QFontMetrics>
@@ -212,5 +213,128 @@ void Artwork::compose()
                Qt::AlignRight | Qt::AlignBottom, u"NOW PLAYING"_s);
     p.end();
 
-    emit frameReady(packMono(frame), ART_FRAME_WIDTH, ART_FRAME_HEIGHT);
+    const QByteArray monoBits = packMono(frame);
+    const QByteArray colorJpeg = composeColorJpeg();
+    emit frameReady(monoBits, ART_FRAME_WIDTH, ART_FRAME_HEIGHT, colorJpeg,
+                    LCD_ART_FRAME_WIDTH, LCD_ART_FRAME_HEIGHT);
+}
+
+QByteArray Artwork::composeColorJpeg() const
+{
+    QImage frame(LCD_ART_FRAME_WIDTH, LCD_ART_FRAME_HEIGHT, QImage::Format_RGB32);
+    const QColor background(u"#101722"_s);
+    const QColor foreground(u"#F3F6FA"_s);
+    const QColor muted(u"#A8B3C2"_s);
+    const QColor accent(u"#36CFC9"_s);
+    frame.fill(background);
+
+    QPainter p(&frame);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setRenderHint(QPainter::SmoothPixmapTransform);
+
+    const QRect artBounds(24, 32, 392, 536);
+    if (!m_artImage.isNull()) {
+        const QImage art = m_artImage.scaled(artBounds.size(), Qt::KeepAspectRatio,
+                                             Qt::SmoothTransformation);
+        const QPoint artTopLeft(artBounds.x() + (artBounds.width() - art.width()) / 2,
+                                artBounds.y() + (artBounds.height() - art.height()) / 2);
+        p.setPen(QPen(accent, 3));
+        p.drawRoundedRect(artBounds.adjusted(-2, -2, 2, 2), 8, 8);
+        p.drawImage(artTopLeft, art);
+    } else {
+        p.setPen(QPen(muted, 2));
+        p.drawRoundedRect(artBounds, 8, 8);
+        QFont missingFont(u"IBM Plex Mono"_s, -1, QFont::Medium);
+        missingFont.setPixelSize(24);
+        p.setFont(missingFont);
+        p.drawText(artBounds, Qt::AlignCenter | Qt::TextWordWrap, u"BOX ART\nNOT AVAILABLE"_s);
+    }
+
+    const int textLeft = 456;
+    const int textWidth = LCD_ART_FRAME_WIDTH - textLeft - 24;
+    QFont eyebrowFont(u"IBM Plex Mono"_s, -1, QFont::Bold);
+    eyebrowFont.setPixelSize(20);
+    p.setFont(eyebrowFont);
+    p.setPen(accent);
+    p.drawText(textLeft, 54, u"NOW PLAYING"_s);
+    p.fillRect(textLeft, 68, 74, 4, accent);
+
+    QFont titleFont(u"IBM Plex Mono"_s, -1, QFont::Bold);
+    QRect titleRect;
+    for (int px = 46; px >= 28; px -= 2) {
+        titleFont.setPixelSize(px);
+        QFontMetrics fm(titleFont);
+        titleRect = fm.boundingRect(QRect(textLeft, 94, textWidth, 0), Qt::TextWordWrap,
+                                    m_app.name);
+        if (titleRect.height() <= 168) {
+            break;
+        }
+    }
+    p.setFont(titleFont);
+    p.setPen(foreground);
+    p.drawText(QRect(textLeft, 94, textWidth, titleRect.height()), Qt::TextWordWrap, m_app.name);
+
+    int y = 94 + titleRect.height() + 34;
+    QFont labelFont(u"IBM Plex Mono"_s, -1, QFont::Medium);
+    labelFont.setPixelSize(22);
+    QFont valueFont(u"IBM Plex Mono"_s, -1, QFont::Bold);
+    valueFont.setPixelSize(38);
+
+    if (m_playtime >= 0) {
+        p.setFont(labelFont);
+        p.setPen(muted);
+        p.drawText(textLeft, y, u"PLAYTIME"_s);
+        y += 45;
+        p.setFont(valueFont);
+        p.setPen(foreground);
+        if (m_playtime < 60) {
+            p.drawText(textLeft, y, u"%1 MIN"_s.arg(QString::number(m_playtime, 'f', 0)));
+        } else {
+            p.drawText(textLeft, y, u"%1 HRS"_s.arg(QString::number(m_playtime / 60.0, 'f', 1)));
+        }
+        y += 66;
+    }
+
+    if (m_achievements.second > 0) {
+        p.setFont(labelFont);
+        p.setPen(muted);
+        p.drawText(textLeft, y, u"ACHIEVEMENTS"_s);
+        y += 45;
+        p.setFont(valueFont);
+        p.setPen(foreground);
+        p.drawText(textLeft, y,
+                   u"%1 / %2"_s.arg(QString::number(m_achievements.first),
+                                    QString::number(m_achievements.second)));
+        y += 26;
+        const int barWidth = textWidth - 4;
+        const int barHeight = 20;
+        p.setPen(QPen(muted, 2));
+        p.setBrush(Qt::NoBrush);
+        p.drawRoundedRect(QRect(textLeft, y, barWidth, barHeight), 4, 4);
+        const int filled = barWidth * m_achievements.first / m_achievements.second;
+        if (filled > 8) {
+            p.setPen(Qt::NoPen);
+            p.setBrush(accent);
+            p.drawRoundedRect(QRect(textLeft + 3, y + 3, filled - 6, barHeight - 6), 3, 3);
+        }
+    }
+
+    QFont tagFont(u"IBM Plex Mono"_s, -1, QFont::Medium);
+    tagFont.setPixelSize(18);
+    p.setFont(tagFont);
+    p.setPen(muted);
+    p.drawText(QRect(textLeft, 542, textWidth, 24), Qt::AlignRight | Qt::AlignBottom,
+               u"INKTERFACE  •  LCD-5B"_s);
+    p.end();
+
+    for (int quality : {84, 74, 64, 54}) {
+        QByteArray jpeg;
+        QBuffer buffer(&jpeg);
+        if (buffer.open(QIODevice::WriteOnly) && frame.save(&buffer, "JPEG", quality) &&
+            jpeg.size() <= 512 * 1024) {
+            return jpeg;
+        }
+    }
+    qWarning() << "failed to encode color artwork frame within the 512 KiB transfer limit";
+    return {};
 }

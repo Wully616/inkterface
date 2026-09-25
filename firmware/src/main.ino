@@ -4,7 +4,13 @@
 #include <sstream>
 
 #include <Adafruit_MAX1704X.h>
+#if defined(INKTERFACE_LCD5B)
+#define EPD_BLACK 0x18C3
+#define EPD_WHITE 0xFFFF
+#include "lcd5b_display.h"
+#else
 #include <Adafruit_ThinkInk.h>
+#endif
 #include <NimBLEDevice.h>
 #include <esp_sleep.h>
 
@@ -29,17 +35,25 @@
 #define FLUSH_UUID                                                                                 \
     NimBLEUUID { "d6f4c07e-4a21-4c69-bd15-43a38a8719FF" }
 
-#define SPARKBOX_HEIGHT 100
-#define SPARKBOX_WIDTH 209
+#if defined(INKTERFACE_LCD5B)
+static constexpr int16_t SPARKBOX_HEIGHT = 174;
+static constexpr int16_t SPARKBOX_WIDTH = 324;
+#else
+static constexpr int16_t SPARKBOX_HEIGHT = 100;
+static constexpr int16_t SPARKBOX_WIDTH = 209;
+#endif
 
-// full-panel artwork framebuffer, 1bpp row-major with MSB-first bytes
-// (the same layout Adafruit_GFX::drawBitmap() expects); allocated lazily on
-// the first artwork upload because internal DRAM is nearly exhausted by the
-// display's own buffers at boot - PSRAM is preferred when the board has it
+// Full-panel artwork framebuffer, 1bpp row-major with MSB-first bytes (the
+// layout Adafruit_GFX::drawBitmap() expects). Allocate it lazily in PSRAM so
+// internal SRAM remains available for the GFX working image and RGB DMA buffers.
 #define ART_MAX_WIDTH 648
 #define ART_MAX_HEIGHT 480
 #define ART_BUFFER_SIZE ((ART_MAX_WIDTH / 8) * ART_MAX_HEIGHT)
+#define ART_JPEG_MAX_SIZE (512 * 1024)
 static uint8_t *ART_BUFFER = nullptr;
+static uint8_t *ART_JPEG_BUFFER = nullptr;
+static uint32_t ART_JPEG_EXPECTED_SIZE = 0;
+static uint32_t ART_JPEG_RECEIVED_SIZE = 0;
 
 static bool artBufferReady()
 {
@@ -61,6 +75,20 @@ static bool artBufferReady()
 NimBLEServer *BLE_SERVER = nullptr;
 std::string BLE_NAME = "INKTF";
 
+static std::string makeBleName()
+{
+    uint32_t addr = (uint64_t)NimBLEDevice::getAddress() & 0xFFFFFF;
+    std::stringstream name;
+#if defined(INKTERFACE_LCD5B)
+    // The host app uses this short model marker to choose the LCD refresh cadence.
+    name << "INKTF-5B-";
+#else
+    name << "INKTF-";
+#endif
+    name << std::uppercase << std::hex << std::setfill('0') << std::setw(6) << addr;
+    return name.str();
+}
+
 Adafruit_MAX17048 maxlipo;
 bool MAXLIPO_PRESENT = false;
 
@@ -71,28 +99,40 @@ bool INVERTED = false;
 class DualPrint : public Print
 { // {{{
   public:
-    DualPrint(Print &a, Print &b)
+    DualPrint(Print &a, Print *b)
         : _a(a)
         , _b(b)
     {
     }
     size_t write(uint8_t c) override
     {
-        _a.write(c);
-        return _b.write(c);
+        size_t written = _a.write(c);
+        if (_b != nullptr) {
+            _b->write(c);
+        }
+        return written;
     }
     size_t write(const uint8_t *buffer, size_t size) override
     {
-        _a.write(buffer, size);
-        return _b.write(buffer, size);
+        size_t written = _a.write(buffer, size);
+        if (_b != nullptr) {
+            _b->write(buffer, size);
+        }
+        return written;
     }
 
   private:
     Print &_a;
-    Print &_b;
+    Print *_b;
 }; // }}}
-DualPrint Debug(Serial, Serial1);
 
+#if defined(INKTERFACE_LCD5B)
+DualPrint Debug(Serial, nullptr);
+LCD5BDisplay MF_DISPLAY(EPD_BLACK);
+
+static bool beginDisplay() { return MF_DISPLAY.begin(); }
+#else
+DualPrint Debug(Serial, &Serial1);
 class CustomDisp : public ThinkInk_583_Mono_AAAMFGN
 { // {{{
   public:
@@ -131,6 +171,13 @@ class CustomDisp : public ThinkInk_583_Mono_AAAMFGN
 
 // ThinkInk_583_Mono_AAAMFGN MF_DISPLAY(EPD_DC, EPD_RESET, EPD_CS, SRAM_CS, EPD_BUSY);
 CustomDisp MF_DISPLAY(EPD_DC, EPD_RESET, EPD_CS, -1 /* SRAM_CS */, EPD_BUSY);
+
+static bool beginDisplay()
+{
+    MF_DISPLAY.begin(THINKINK_MONO);
+    return true;
+}
+#endif
 
 static unsigned long DISP_DEBOUNCE = 0;
 
@@ -196,8 +243,10 @@ struct State { // {{{
     // when true the display shows the host-provided ART_BUFFER frame
     // instead of the telemetry layout
     bool artMode = false;
+    bool artJpegMode = false;
     uint16_t artWidth = 0;
     uint16_t artHeight = 0;
+    uint32_t artJpegSize = 0;
 
     void reset()
     {
@@ -207,14 +256,12 @@ struct State { // {{{
         sparks.resize(6);
 
         artMode = false;
+        artJpegMode = false;
         artWidth = 0;
         artHeight = 0;
+        artJpegSize = 0;
 
-        uint32_t addr = (uint64_t)NimBLEDevice::getAddress() & 0xFFFFFF;
-        std::stringstream name;
-        name << "INKTF-";
-        name << std::uppercase << std::hex << std::setfill('0') << std::setw(6) << addr;
-        BLE_NAME = name.str();
+        BLE_NAME = makeBleName();
 
         connected = false;
         topLine = "Waiting on connection...";
@@ -364,6 +411,9 @@ class ArtworkCallbacks : public NimBLECharacteristicCallbacks
     //   0x01 DATA:  uint32 byte offset, then raw 1bpp payload bytes
     //   0x02 SHOW:  switch the display to the uploaded frame
     //   0x03 CLEAR: return the display to the telemetry layout
+    //   0x04 JPEG_BEGIN: uint16 width, uint16 height, uint32 byte count
+    //   0x05 JPEG_DATA:  uint32 byte offset, then JPEG payload bytes
+    //   0x06 JPEG_SHOW:  decode and present the complete native-size color frame
     void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &conn) override
     {
         std::string value = characteristic->getValue();
@@ -389,6 +439,8 @@ class ArtworkCallbacks : public NimBLECharacteristicCallbacks
             }
             STATE.artWidth = w;
             STATE.artHeight = h;
+            STATE.artJpegMode = false;
+            STATE.artJpegSize = 0;
             memset(ART_BUFFER, 0, ART_BUFFER_SIZE);
             break;
         }
@@ -417,6 +469,7 @@ class ArtworkCallbacks : public NimBLECharacteristicCallbacks
             }
             Debug.println("showing artwork frame");
             STATE.artMode = true;
+            STATE.artJpegMode = false;
             DISP_DEBOUNCE = 100;
             break;
         }
@@ -427,10 +480,80 @@ class ArtworkCallbacks : public NimBLECharacteristicCallbacks
             if (STATE.artMode) {
                 Debug.println("leaving artwork mode");
                 STATE.artMode = false;
+                STATE.artJpegMode = false;
                 DISP_DEBOUNCE = 100;
             }
             break;
         }
+#if defined(INKTERFACE_LCD5B)
+        case 0x04: {
+            if (value.length() < 9) {
+                Debug.println("got short JPEG artwork begin message");
+                return;
+            }
+            const uint16_t w = data[1] | (data[2] << 8);
+            const uint16_t h = data[3] | (data[4] << 8);
+            const uint32_t byteCount = static_cast<uint32_t>(data[5]) |
+                                       (static_cast<uint32_t>(data[6]) << 8) |
+                                       (static_cast<uint32_t>(data[7]) << 16) |
+                                       (static_cast<uint32_t>(data[8]) << 24);
+            if (w != LCD5B_WIDTH || h != LCD5B_HEIGHT || byteCount == 0 ||
+                byteCount > ART_JPEG_MAX_SIZE) {
+                Debug.println("rejecting unsupported or oversized JPEG artwork frame");
+                ART_JPEG_EXPECTED_SIZE = 0;
+                ART_JPEG_RECEIVED_SIZE = 0;
+                return;
+            }
+            if (ART_JPEG_BUFFER == nullptr) {
+                ART_JPEG_BUFFER = static_cast<uint8_t *>(ps_malloc(ART_JPEG_MAX_SIZE));
+                if (ART_JPEG_BUFFER == nullptr) {
+                    Debug.println("no PSRAM for JPEG artwork frame");
+                    ART_JPEG_EXPECTED_SIZE = 0;
+                    ART_JPEG_RECEIVED_SIZE = 0;
+                    return;
+                }
+            }
+            ART_JPEG_EXPECTED_SIZE = byteCount;
+            ART_JPEG_RECEIVED_SIZE = 0;
+            break;
+        }
+        case 0x05: {
+            if (value.length() < 6 || ART_JPEG_BUFFER == nullptr ||
+                ART_JPEG_EXPECTED_SIZE == 0) {
+                Debug.println("ignoring JPEG data before a valid begin message");
+                return;
+            }
+            const uint32_t offset = static_cast<uint32_t>(data[1]) |
+                                    (static_cast<uint32_t>(data[2]) << 8) |
+                                    (static_cast<uint32_t>(data[3]) << 16) |
+                                    (static_cast<uint32_t>(data[4]) << 24);
+            const size_t len = value.length() - 5;
+            if (offset != ART_JPEG_RECEIVED_SIZE || offset + len > ART_JPEG_EXPECTED_SIZE) {
+                Debug.println("rejecting out-of-order or oversized JPEG artwork data");
+                ART_JPEG_EXPECTED_SIZE = 0;
+                ART_JPEG_RECEIVED_SIZE = 0;
+                return;
+            }
+            memcpy(ART_JPEG_BUFFER + offset, data + 5, len);
+            ART_JPEG_RECEIVED_SIZE += len;
+            break;
+        }
+        case 0x06: {
+            if (ART_JPEG_EXPECTED_SIZE == 0 ||
+                ART_JPEG_RECEIVED_SIZE != ART_JPEG_EXPECTED_SIZE) {
+                Debug.println("ignoring incomplete JPEG artwork frame");
+                return;
+            }
+            STATE.artWidth = LCD5B_WIDTH;
+            STATE.artHeight = LCD5B_HEIGHT;
+            STATE.artJpegSize = ART_JPEG_EXPECTED_SIZE;
+            STATE.artJpegMode = true;
+            STATE.artMode = true;
+            Debug.println("showing full-color JPEG artwork frame");
+            DISP_DEBOUNCE = 100;
+            break;
+        }
+#endif
         default: {
             Debug.print("got unknown artwork opcode: ");
             Debug.println(data[0]);
@@ -449,11 +572,150 @@ class FlushCallbacks : public NimBLECharacteristicCallbacks
     }
 } FLUSH_CALLBACKS; // }}}
 
+#if defined(INKTERFACE_LCD5B) && defined(LCD5B_ANIMATION_TEST)
+static constexpr uint8_t LCD_TEST_FRAME_RATES[] = {15, 26, 41};
+static constexpr uint32_t LCD_TEST_PHASE_MS = 8000;
+
+static void drawLcdAnimationFrame(uint8_t targetFps, uint32_t frameNumber)
+{
+    MF_DISPLAY.clearBuffer();
+    MF_DISPLAY.fillScreen(BG_COLOR);
+    MF_DISPLAY.drawRect(0, 0, LCD5B_WIDTH, LCD5B_HEIGHT, FG_COLOR);
+    MF_DISPLAY.drawFastHLine(0, LCD5B_HEIGHT / 2, LCD5B_WIDTH, FG_COLOR);
+    MF_DISPLAY.drawFastVLine(LCD5B_WIDTH / 2, 0, LCD5B_HEIGHT, FG_COLOR);
+
+    MF_DISPLAY.setTextColor(FG_COLOR);
+    MF_DISPLAY.setTextSize(2);
+    MF_DISPLAY.setCursor(20, 18);
+    MF_DISPLAY.print("LCD-5B FRAME TEST");
+    MF_DISPLAY.setTextSize(1);
+    MF_DISPLAY.setCursor(20, 54);
+    MF_DISPLAY.print("TARGET ");
+    MF_DISPLAY.print(targetFps);
+    MF_DISPLAY.print(" FPS  |  MOVING BAR");
+
+    const int16_t travel = LCD5B_WIDTH - 96;
+    const uint32_t span = static_cast<uint32_t>(travel) * 2;
+    const int16_t offset = static_cast<int16_t>((frameNumber * 12) % span);
+    const int16_t barX = 32 + (offset <= travel ? offset : span - offset);
+    MF_DISPLAY.fillRect(barX, 150, 64, 220, FG_COLOR);
+    MF_DISPLAY.fillRect(barX + 12, 162, 40, 196, BG_COLOR);
+    MF_DISPLAY.fillCircle(barX + 32, 260, 12, FG_COLOR);
+    MF_DISPLAY.display();
+}
+
+static void runLcdAnimationTest()
+{
+    static uint8_t rateIndex = 0;
+    static uint32_t phaseStartMs = 0;
+    static uint32_t reportStartMs = 0;
+    static uint32_t framesInWindow = 0;
+    static uint32_t renderTotalUs = 0;
+    static uint32_t renderMaxUs = 0;
+    static uint32_t rasterTotalUs = 0;
+    static uint32_t rasterMaxUs = 0;
+    static uint32_t presentTotalUs = 0;
+    static uint32_t presentMaxUs = 0;
+    static uint32_t frameNumber = 0;
+    static uint32_t nextFrameUs = 0;
+
+    const uint32_t nowMs = millis();
+    const uint32_t nowUs = micros();
+    if (phaseStartMs == 0) {
+        phaseStartMs = nowMs;
+        reportStartMs = nowMs;
+        nextFrameUs = nowUs;
+        Serial.println("LCD animation test: cycling target rates 15, 26, 41 FPS");
+    } else if (nowMs - phaseStartMs >= LCD_TEST_PHASE_MS) {
+        rateIndex = (rateIndex + 1) % (sizeof(LCD_TEST_FRAME_RATES) / sizeof(LCD_TEST_FRAME_RATES[0]));
+        phaseStartMs = nowMs;
+        reportStartMs = nowMs;
+        framesInWindow = 0;
+        renderTotalUs = 0;
+        renderMaxUs = 0;
+        rasterTotalUs = 0;
+        rasterMaxUs = 0;
+        presentTotalUs = 0;
+        presentMaxUs = 0;
+        nextFrameUs = nowUs;
+        Serial.printf("LCD animation target changed to %u FPS\n", LCD_TEST_FRAME_RATES[rateIndex]);
+    }
+
+    const uint8_t targetFps = LCD_TEST_FRAME_RATES[rateIndex];
+    const uint32_t frameIntervalUs = 1000000UL / targetFps;
+    if (static_cast<int32_t>(nowUs - nextFrameUs) >= 0) {
+        const uint32_t renderStartUs = micros();
+        drawLcdAnimationFrame(targetFps, frameNumber++);
+        const uint32_t renderTimeUs = micros() - renderStartUs;
+        const uint32_t rasterTimeUs = MF_DISPLAY.lastRasterUs();
+        const uint32_t presentWaitUs = MF_DISPLAY.lastPresentWaitUs();
+        nextFrameUs = renderStartUs + frameIntervalUs;
+
+        ++framesInWindow;
+        renderTotalUs += renderTimeUs;
+        rasterTotalUs += rasterTimeUs;
+        presentTotalUs += presentWaitUs;
+        if (renderTimeUs > renderMaxUs) {
+            renderMaxUs = renderTimeUs;
+        }
+        if (rasterTimeUs > rasterMaxUs) {
+            rasterMaxUs = rasterTimeUs;
+        }
+        if (presentWaitUs > presentMaxUs) {
+            presentMaxUs = presentWaitUs;
+        }
+        if (renderTimeUs < frameIntervalUs) {
+            delayMicroseconds(frameIntervalUs - renderTimeUs);
+        }
+    }
+
+    const uint32_t elapsedMs = millis() - reportStartMs;
+    if (elapsedMs >= 1000) {
+        const uint32_t actualFpsTenths = (framesInWindow * 10000UL + elapsedMs / 2) / elapsedMs;
+        const uint32_t averageRenderUs = framesInWindow ? renderTotalUs / framesInWindow : 0;
+        const uint32_t averageRasterUs = framesInWindow ? rasterTotalUs / framesInWindow : 0;
+        const uint32_t averagePresentWaitUs = framesInWindow ? presentTotalUs / framesInWindow : 0;
+        Serial.printf("LCD animation: target=%u FPS actual=%lu.%lu FPS frame(avg/max)=%lu/%lu us raster(avg/max)=%lu/%lu us present-wait(avg/max)=%lu/%lu us\n",
+                      targetFps, static_cast<unsigned long>(actualFpsTenths / 10),
+                      static_cast<unsigned long>(actualFpsTenths % 10),
+                      static_cast<unsigned long>(averageRenderUs),
+                      static_cast<unsigned long>(renderMaxUs),
+                      static_cast<unsigned long>(averageRasterUs),
+                      static_cast<unsigned long>(rasterMaxUs),
+                      static_cast<unsigned long>(averagePresentWaitUs),
+                      static_cast<unsigned long>(presentMaxUs));
+        reportStartMs = millis();
+        framesInWindow = 0;
+        renderTotalUs = 0;
+        renderMaxUs = 0;
+        rasterTotalUs = 0;
+        rasterMaxUs = 0;
+        presentTotalUs = 0;
+        presentMaxUs = 0;
+    }
+}
+#endif
+
 void setup()
 { // {{{
     Serial.begin(115200);
+#if defined(INKTERFACE_LCD5B)
+    Wire.begin(8, 9);
+#else
     Serial1.begin(115200);
-    // these usb serial and rx/tx interfaces are combined in the Debug instance
+#endif
+    // USB serial and, on the Feather targets, the auxiliary UART feed Debug.
+
+#if defined(INKTERFACE_LCD5B) && defined(LCD5B_ANIMATION_TEST)
+    if (!beginDisplay()) {
+        Serial.println("LCD animation test failed to initialize the display");
+        while (true) {
+            delay(1000);
+        }
+    }
+    Serial.println("LCD animation test is running; BLE is intentionally disabled");
+    return;
+#endif
 
 #if defined(STARTUP_DELAY_MS)
     delay(STARTUP_DELAY_MS);
@@ -505,10 +767,12 @@ void setup()
     BLE_SERVER->start();
 
     Debug.println("initializing display");
+#if !defined(INKTERFACE_LCD5B)
     pinMode(EPD_EN, OUTPUT);
     digitalWrite(EPD_EN, HIGH);
+#endif
     STATE.reset();
-    MF_DISPLAY.begin(THINKINK_MONO);
+    beginDisplay();
     MF_DISPLAY.clearBuffer();
     MF_DISPLAY.fillScreen(BG_COLOR);
 #if defined(GABEN_STARTUP)
@@ -520,11 +784,7 @@ void setup()
     DISP_DEBOUNCE = 10;
 
     Debug.println("starting ble advert");
-    uint32_t addr = (uint64_t)NimBLEDevice::getAddress() & 0xFFFFFF;
-    std::stringstream name;
-    name << "INKTF-";
-    name << std::uppercase << std::hex << std::setfill('0') << std::setw(6) << addr;
-    BLE_NAME = name.str();
+    BLE_NAME = makeBleName();
     BLEAdvertising *advert = NimBLEDevice::getAdvertising();
     // A BLE advertisement payload is capped at 31 bytes. Flags + the name +
     // our manufacturer data (the interface version the app uses to decide the
@@ -554,6 +814,11 @@ void setup()
 
 void loop()
 { // {{{
+#if defined(INKTERFACE_LCD5B) && defined(LCD5B_ANIMATION_TEST)
+    runLcdAnimationTest();
+    return;
+#endif
+
     static unsigned long LAST_MS = 0;
     static unsigned long CONN_DEBOUNCE = 5000;
     static unsigned long BATT_DEBOUNCE = 1000;
@@ -614,7 +879,7 @@ void loop()
     if (MAXLIPO_PRESENT && last_battv < BATT_MINV) {
         Debug.println("drawing low battery message");
         DISP_DEBOUNCE = 0;
-        MF_DISPLAY.begin(THINKINK_MONO);
+        beginDisplay();
         MF_DISPLAY.clearBuffer();
         MF_DISPLAY.fillScreen(BG_COLOR);
         drawLowBatt();
@@ -631,15 +896,48 @@ void loop()
     } else if (DISP_DEBOUNCE > 0) {
         Debug.println("drawing to display");
         DISP_DEBOUNCE = 0;
-        MF_DISPLAY.begin(THINKINK_MONO);
-        MF_DISPLAY.clearBuffer();
-        MF_DISPLAY.fillScreen(BG_COLOR);
-        if (STATE.artMode) {
-            drawArt();
-        } else {
-            drawStatic();
+#if defined(INKTERFACE_LCD5B)
+        const uint32_t updateStartUs = micros();
+        uint32_t compositionUs = 0;
+#endif
+        beginDisplay();
+        bool jpegPresented = false;
+#if defined(INKTERFACE_LCD5B)
+        if (STATE.artMode && STATE.artJpegMode) {
+            jpegPresented = MF_DISPLAY.displayJpeg(ART_JPEG_BUFFER, STATE.artJpegSize);
+            if (!jpegPresented) {
+                Debug.println("failed to decode or present color artwork; showing telemetry");
+                STATE.artMode = false;
+                STATE.artJpegMode = false;
+            }
         }
-        MF_DISPLAY.display();
+#endif
+        if (!jpegPresented) {
+            MF_DISPLAY.clearBuffer();
+            MF_DISPLAY.fillScreen(BG_COLOR);
+            if (STATE.artMode && !STATE.artJpegMode) {
+                drawArt();
+            } else {
+                drawStatic();
+            }
+#if defined(INKTERFACE_LCD5B)
+            compositionUs = micros() - updateStartUs;
+#endif
+            MF_DISPLAY.display();
+        }
+#if defined(INKTERFACE_LCD5B)
+        const uint32_t totalUs = micros() - updateStartUs;
+        if (jpegPresented) {
+            const uint32_t renderUs = MF_DISPLAY.lastRasterUs();
+            const uint32_t waitUs = MF_DISPLAY.lastPresentWaitUs();
+            compositionUs = totalUs > renderUs + waitUs ? totalUs - renderUs - waitUs : 0;
+        }
+        Serial.printf("LCD update: compose=%lu raster=%lu present-wait=%lu total=%lu us\n",
+                      static_cast<unsigned long>(compositionUs),
+                      static_cast<unsigned long>(MF_DISPLAY.lastRasterUs()),
+                      static_cast<unsigned long>(MF_DISPLAY.lastPresentWaitUs()),
+                      static_cast<unsigned long>(totalUs));
+#endif
         MF_DISPLAY.powerDown();
         Debug.println("drew to display");
     }
@@ -658,23 +956,31 @@ loop_end:
 } // }}}
 
 void drawText(const char *text, const int16_t &x = -1, const int16_t &y = -1,
-              const uint8_t &size = 1, const bool &wrap = false)
+              const uint8_t &size = 1, const bool &wrap = false,
+              const uint16_t &color = FG_COLOR)
 { // {{{
     if (x >= 0 && y >= 0) {
         MF_DISPLAY.setCursor(x, y);
     }
     MF_DISPLAY.setTextSize(size);
-    MF_DISPLAY.setTextColor(FG_COLOR);
+    MF_DISPLAY.setTextColor(color);
     MF_DISPLAY.setTextWrap(wrap);
     MF_DISPLAY.print(text);
 } // }}}
 
 void drawLogo(int16_t &x, const int16_t &y = 0)
 { // {{{
+#if defined(INKTERFACE_LCD5B)
+    MF_DISPLAY.fillRoundRect(x, y, 116, 116, 4, FG_COLOR);
+    MF_DISPLAY.fillCircle(x + 58, y + 58, 36, BG_COLOR);
+    MF_DISPLAY.fillCircle(x + 58, y + 58, 27, LCD5B_ACCENT_COLOR);
+    x += 116;
+#else
     MF_DISPLAY.fillRoundRect(x, y, 101, 101, 3, FG_COLOR);
     MF_DISPLAY.fillCircle(x + 50, y + 50, 31, BG_COLOR);
     MF_DISPLAY.fillCircle(x + 50, y + 50, 23, FG_COLOR);
     x += 101;
+#endif
 } // }}}
 
 void drawSparkbox(int16_t &x, const int16_t &y, std::string &title, const std::string &value,
@@ -682,6 +988,18 @@ void drawSparkbox(int16_t &x, const int16_t &y, std::string &title, const std::s
 { // {{{
     const int16_t w = SPARKBOX_WIDTH;
     const int16_t h = SPARKBOX_HEIGHT;
+#if defined(INKTERFACE_LCD5B)
+    const int16_t hpad = 12;
+    const int16_t vpad = 8;
+    const int16_t title_h = 38;
+    const int16_t graph_h = (h - title_h) - 48;
+    const int16_t graph_w = w - 30;
+    const int16_t graph_x = x + 15;
+    const int16_t graph_y = (y + h) - 24;
+    const uint8_t labelSize = 2;
+    const uint8_t titleSize = 3;
+    const uint16_t graphColor = LCD5B_ACCENT_COLOR;
+#else
     const int16_t hpad = 8;
     const int16_t vpad = 6;
     const int16_t title_h = 26;
@@ -689,23 +1007,38 @@ void drawSparkbox(int16_t &x, const int16_t &y, std::string &title, const std::s
     const int16_t graph_w = w - 20;
     const int16_t graph_x = x + 10;
     const int16_t graph_y = (y + h) - 16;
+    const uint8_t labelSize = 1;
+    const uint8_t titleSize = 2;
+    const uint16_t graphColor = FG_COLOR;
+#endif
 
     if (!title.empty()) {
         MF_DISPLAY.drawRoundRect(x, y, w, h, 4, FG_COLOR);
         MF_DISPLAY.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 4, FG_COLOR);
         MF_DISPLAY.fillRect(x, y + title_h, w, 1, FG_COLOR);
-        drawText(title.c_str(), x + hpad, y + vpad, 2);
-        drawText(value.c_str(), (x + (w - hpad)) - (12 * strlen(value.c_str())), y + vpad, 2);
+        drawText(title.c_str(), x + hpad, y + vpad, titleSize);
+        drawText(value.c_str(), (x + (w - hpad)) - (6 * titleSize * strlen(value.c_str())),
+                 y + vpad, titleSize);
 
         std::stringstream maxstrm;
         maxstrm << std::fixed << std::setprecision(0) << points.yMax;
         auto maxstr = maxstrm.str();
-        drawText(maxstr.c_str(), x + hpad, y + title_h + vpad);
+#if defined(INKTERFACE_LCD5B)
+        drawText(maxstr.c_str(), x + hpad, y + title_h + vpad, labelSize, false,
+                 LCD5B_MUTED_COLOR);
+#else
+        drawText(maxstr.c_str(), x + hpad, y + title_h + vpad, labelSize);
+#endif
 
         std::stringstream minstrm;
         minstrm << std::fixed << std::setprecision(0) << points.yMin;
         auto minstr = minstrm.str();
-        drawText(minstr.c_str(), x + hpad, y + h - (vpad + 7));
+#if defined(INKTERFACE_LCD5B)
+        drawText(minstr.c_str(), x + hpad, y + h - (vpad + 7), labelSize, false,
+                 LCD5B_MUTED_COLOR);
+#else
+        drawText(minstr.c_str(), x + hpad, y + h - (vpad + 7), labelSize);
+#endif
 
         if (points.points.size() >= 2) {
             int16_t s_x = 0.0, s_y = 0.0, e_x = 0.0, e_y = 0.0;
@@ -714,11 +1047,11 @@ void drawSparkbox(int16_t &x, const int16_t &y, std::string &title, const std::s
                 e_x = graph_x + ((p + 1)->x * graph_w);
                 s_y = graph_y + (p->y * graph_h * -1.0);
                 e_y = graph_y + ((p + 1)->y * graph_h * -1.0);
-                MF_DISPLAY.drawLine(s_x, s_y, e_x, e_y, FG_COLOR);
-                MF_DISPLAY.drawLine(s_x, s_y - 1, e_x, e_y - 1, FG_COLOR);
-                MF_DISPLAY.drawLine(s_x, s_y + 1, e_x, e_y + 1, FG_COLOR);
-                MF_DISPLAY.drawLine(s_x - 1, s_y, e_x - 1, e_y, FG_COLOR);
-                MF_DISPLAY.drawLine(s_x + 1, s_y, e_x + 1, e_y, FG_COLOR);
+                MF_DISPLAY.drawLine(s_x, s_y, e_x, e_y, graphColor);
+                MF_DISPLAY.drawLine(s_x, s_y - 1, e_x, e_y - 1, graphColor);
+                MF_DISPLAY.drawLine(s_x, s_y + 1, e_x, e_y + 1, graphColor);
+                MF_DISPLAY.drawLine(s_x - 1, s_y, e_x - 1, e_y, graphColor);
+                MF_DISPLAY.drawLine(s_x + 1, s_y, e_x + 1, e_y, graphColor);
             }
         }
     }
@@ -729,16 +1062,26 @@ void drawSparkbox(int16_t &x, const int16_t &y, std::string &title, const std::s
 void drawDiscreteBox(int16_t &x, const int16_t &y, const std::string &title,
                      const std::string &value)
 { // {{{
+#if defined(INKTERFACE_LCD5B)
+    const int16_t w = 324;
+    const int16_t h = 42;
+    const int16_t hpad = 12;
+    const int16_t vpad = 10;
+    const uint8_t textSize = 3;
+#else
     const int16_t w = 209;
     const int16_t h = 26;
     const int16_t hpad = 8;
     const int16_t vpad = 6;
+    const uint8_t textSize = 2;
+#endif
 
     if (!title.empty()) {
         MF_DISPLAY.drawRoundRect(x, y, w, h, 4, FG_COLOR);
         MF_DISPLAY.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 4, FG_COLOR);
-        drawText(title.c_str(), x + hpad, y + vpad, 2);
-        drawText(value.c_str(), (x + (w - hpad)) - (12 * strlen(value.c_str())), y + vpad, 2);
+        drawText(title.c_str(), x + hpad, y + vpad, textSize);
+        drawText(value.c_str(), (x + (w - hpad)) - (6 * textSize * strlen(value.c_str())),
+                 y + vpad, textSize);
     }
 
     x += w;
@@ -749,6 +1092,56 @@ void drawStatic()
     int16_t x = 0;
     int16_t y = 0;
 
+#if defined(INKTERFACE_LCD5B)
+    x = 16;
+    y = 12;
+    drawLogo(x, y);
+
+    x = 156;
+    y = 18;
+    drawText(STATE.topLine.c_str(), x, y, 4);
+    y += 42;
+    drawText(STATE.midLine.c_str(), x, y, 3);
+    y += 30;
+    drawText(STATE.botLine.c_str(), x, y, 2);
+
+    x = 16;
+    y = 126;
+    drawDiscreteBox(x, y, STATE.keyvals[0].key, STATE.keyvals[0].val);
+    x += 10;
+    drawDiscreteBox(x, y, STATE.keyvals[1].key, STATE.keyvals[1].val);
+    x += 10;
+    drawDiscreteBox(x, y, STATE.keyvals[2].key, STATE.keyvals[2].val);
+
+    x = 16;
+    y = 180;
+    drawSparkbox(x, y, STATE.keyvals[3].key, STATE.keyvals[3].val, STATE.sparks[0]);
+    x += 8;
+    drawSparkbox(x, y, STATE.keyvals[4].key, STATE.keyvals[4].val, STATE.sparks[1]);
+    x += 8;
+    drawSparkbox(x, y, STATE.keyvals[5].key, STATE.keyvals[5].val, STATE.sparks[2]);
+
+    x = 16;
+    y += SPARKBOX_HEIGHT + 8;
+    drawSparkbox(x, y, STATE.keyvals[6].key, STATE.keyvals[6].val, STATE.sparks[3]);
+    x += 8;
+    drawSparkbox(x, y, STATE.keyvals[7].key, STATE.keyvals[7].val, STATE.sparks[4]);
+    x += 8;
+    drawSparkbox(x, y, STATE.keyvals[8].key, STATE.keyvals[8].val, STATE.sparks[5]);
+
+    x = 16;
+    y = MF_DISPLAY.height() - 34;
+    drawText(STATE.battLine.c_str(), x, y, 1);
+
+    std::stringstream tag;
+    tag << BLE_NAME << " " << GIT_REVISION << " " << INTERFACE_VERSION;
+    x = 16;
+    y = MF_DISPLAY.height() - 13;
+    drawText(tag.str().c_str(), x, y, 1);
+
+    x = MF_DISPLAY.width() - (6 * strlen(STATE.hostMsg.c_str())) - 16;
+    drawText(STATE.hostMsg.c_str(), x, y, 1);
+#else
     // fremont logo in top left corner
     x = 5;
     y = 5;
@@ -805,6 +1198,7 @@ void drawStatic()
     // host message if provided (usually a timestamp)
     x = MF_DISPLAY.width() - (6 * strlen(STATE.hostMsg.c_str())) - 5;
     drawText(STATE.hostMsg.c_str(), x, y);
+#endif
 } // }}}
 
 void drawArt()

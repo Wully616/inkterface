@@ -7,6 +7,7 @@
 #include <QObject>
 #include <QSettings>
 #include <QUuid>
+#include <utility>
 
 #define SERVICE_UUID                                                                               \
     QUuid { "95c7b479-8e84-4ce7-a121-faf74bf48c84" }
@@ -26,7 +27,6 @@
     QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a8719FF" }
 
 #define CONN_INTERVAL 2000
-#define SEND_INTERVAL 30000
 
 // durations that can trigger connection re-evaluation (in seconds)
 #define CONN_WARNING std::chrono::duration<double>(45)
@@ -49,7 +49,7 @@ Panel::Panel(QObject *parent)
     m_connTimer->start();
 
     m_sendTimer->setSingleShot(false);
-    m_sendTimer->setInterval(SEND_INTERVAL);
+    m_sendTimer->setInterval(EINK_SEND_INTERVAL_MS);
     connect(m_sendTimer, &QTimer::timeout, this, &Panel::sendState);
     m_sendTimer->start();
 
@@ -148,11 +148,15 @@ void Panel::onServiceCharacteristicWritten(
     }
 }
 
-void Panel::onArtworkFrame(QByteArray bits, quint16 width, quint16 height)
+void Panel::onArtworkFrame(QByteArray monoBits, quint16 monoWidth, quint16 monoHeight,
+                           QByteArray colorJpeg, quint16 colorWidth, quint16 colorHeight)
 {
-    m_pendingArtBits = bits;
-    m_pendingArtWidth = width;
-    m_pendingArtHeight = height;
+    m_pendingArtBits = std::move(monoBits);
+    m_pendingArtWidth = monoWidth;
+    m_pendingArtHeight = monoHeight;
+    m_pendingColorArtJpeg = std::move(colorJpeg);
+    m_pendingColorArtWidth = colorWidth;
+    m_pendingColorArtHeight = colorHeight;
     m_artworkActive = true;
     queueArtworkFrame();
 }
@@ -170,6 +174,10 @@ void Panel::sendArtworkClear()
 {
     m_artQueue.clear();
     m_artSending = false;
+    m_pendingArtBits.clear();
+    m_pendingColorArtJpeg.clear();
+    m_pendingColorArtWidth = 0;
+    m_pendingColorArtHeight = 0;
     if (!m_service || m_service->state() != QLowEnergyService::RemoteServiceDiscovered) {
         return;
     }
@@ -186,7 +194,7 @@ void Panel::reconcileArtwork()
     // a clear was dropped while disconnected), so always assert our intent:
     // re-send the active frame, or clear. The firmware ignores a clear when it
     // is already showing telemetry, so an idle reconcile costs nothing.
-    if (m_artworkActive && !m_pendingArtBits.isEmpty()) {
+    if (m_artworkActive && (!m_pendingArtBits.isEmpty() || !m_pendingColorArtJpeg.isEmpty())) {
         queueArtworkFrame();
     } else {
         sendArtworkClear();
@@ -197,7 +205,12 @@ void Panel::queueArtworkFrame()
 {
     m_artQueue.clear();
     m_artSending = false;
-    if (m_pendingArtBits.isEmpty()) {
+    const bool lcd5b = m_device.name().startsWith(u"INKTF-5B-"_s);
+    const bool colorJpeg = lcd5b && !m_pendingColorArtJpeg.isEmpty();
+    const QByteArray &frame = colorJpeg ? m_pendingColorArtJpeg : m_pendingArtBits;
+    const quint16 width = colorJpeg ? m_pendingColorArtWidth : m_pendingArtWidth;
+    const quint16 height = colorJpeg ? m_pendingColorArtHeight : m_pendingArtHeight;
+    if (frame.isEmpty()) {
         return;
     }
     if (!m_service || m_service->state() != QLowEnergyService::RemoteServiceDiscovered) {
@@ -210,11 +223,18 @@ void Panel::queueArtworkFrame()
     }
 
     QByteArray begin;
-    begin.append(char(0x00));
-    begin.append(char(m_pendingArtWidth & 0xFF));
-    begin.append(char((m_pendingArtWidth >> 8) & 0xFF));
-    begin.append(char(m_pendingArtHeight & 0xFF));
-    begin.append(char((m_pendingArtHeight >> 8) & 0xFF));
+    begin.append(char(colorJpeg ? 0x04 : 0x00));
+    begin.append(char(width & 0xFF));
+    begin.append(char((width >> 8) & 0xFF));
+    begin.append(char(height & 0xFF));
+    begin.append(char((height >> 8) & 0xFF));
+    if (colorJpeg) {
+        const uint32_t byteCount = static_cast<uint32_t>(frame.size());
+        begin.append(char(byteCount & 0xFF));
+        begin.append(char((byteCount >> 8) & 0xFF));
+        begin.append(char((byteCount >> 16) & 0xFF));
+        begin.append(char((byteCount >> 24) & 0xFF));
+    }
     m_artQueue.append(begin);
 
     // 5 bytes of chunk header, 3 bytes of ATT header; Qt's BlueZ backend
@@ -223,20 +243,21 @@ void Panel::queueArtworkFrame()
     // oversized writes into long-write procedures transparently anyway, so
     // a fixed chunk size is both safe and dramatically faster
     const int chunkSize = 244;
-    for (qsizetype offset = 0; offset < m_pendingArtBits.size(); offset += chunkSize) {
+    for (qsizetype offset = 0; offset < frame.size(); offset += chunkSize) {
         QByteArray chunk;
-        chunk.append(char(0x01));
+        chunk.append(char(colorJpeg ? 0x05 : 0x01));
         chunk.append(char(offset & 0xFF));
         chunk.append(char((offset >> 8) & 0xFF));
         chunk.append(char((offset >> 16) & 0xFF));
         chunk.append(char((offset >> 24) & 0xFF));
-        chunk.append(m_pendingArtBits.mid(offset, chunkSize));
+        chunk.append(frame.mid(offset, chunkSize));
         m_artQueue.append(chunk);
     }
-    m_artQueue.append(QByteArray(1, char(0x02)));
+    m_artQueue.append(QByteArray(1, char(colorJpeg ? 0x06 : 0x02)));
 
-    qDebug() << "queued artwork frame in" << m_artQueue.size() << "chunks of" << chunkSize
-             << "bytes";
+    qDebug() << "queued" << (colorJpeg ? "color JPEG" : "monochrome")
+             << "artwork frame" << width << "x" << height << "(" << frame.size()
+             << "bytes) in" << m_artQueue.size() - 2 << "chunks of" << chunkSize << "bytes";
     sendArtwork();
 }
 
@@ -369,6 +390,8 @@ void Panel::connCheck()
     }
     m_finder->stopDiscovery();
     m_connecting = true;
+    m_sendInterval = panel->isLcd5b() ? LCD5B_SEND_INTERVAL_MS : EINK_SEND_INTERVAL_MS;
+    qDebug() << "Using state send interval of" << m_sendInterval << "ms for" << panel->name();
     m_device = panel->bleInfo();
     qDebug() << "Connecting to " << m_device.name() << ", valid" << m_device.isValid() << ", cached"
              << m_device.isCached();
@@ -429,6 +452,6 @@ void Panel::sendState()
     }
     flushDisplay();
 
-    m_sendTimer->setInterval(SEND_INTERVAL);
+    m_sendTimer->setInterval(m_sendInterval);
     m_sendTimer->start();
 }
