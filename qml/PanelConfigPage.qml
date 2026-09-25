@@ -78,6 +78,50 @@ Item {
         }
     }
 
+    ColumnLayout {
+        id: lcdBrightnessRow
+
+        anchors.left: titleLineLayout.left
+        anchors.right: titleLineLayout.right
+        anchors.top: titleLineLayout.bottom
+        height: visible ? implicitHeight : 0
+        spacing: 0
+        visible: panel && panel.lcd5b
+
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 10
+
+            VLabel {
+                text: "LCD Backlight"
+            }
+
+            Slider {
+                id: brightnessSlider
+
+                Layout.fillWidth: true
+                from: 0
+                stepSize: 1
+                to: 100
+                value: panelState.lcdBrightness
+
+                onMoved: panelState.lcdBrightness = Math.round(value)
+            }
+
+            VLabel {
+                horizontalAlignment: Text.AlignRight
+                text: `${Math.round(brightnessSlider.value)}%`
+                width: 52
+            }
+        }
+
+        VLabel {
+            font.pixelSize: 14
+            opacity: 0.75
+            text: "Brightness control requires the GPIO43-to-PWM solder mod."
+        }
+    }
+
     GridLayout {
         id: readoutGrid
 
@@ -85,7 +129,7 @@ Item {
         anchors.bottomMargin: 10
         anchors.left: topRow.left
         anchors.right: topRow.right
-        anchors.top: titleLineLayout.bottom
+        anchors.top: lcdBrightnessRow.bottom
         anchors.topMargin: 10
         columnSpacing: 10
         columns: 3

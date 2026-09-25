@@ -15,6 +15,9 @@ static constexpr int16_t LCD5B_WIDTH = 1024;
 static constexpr int16_t LCD5B_HEIGHT = 600;
 static constexpr uint16_t LCD5B_ACCENT_COLOR = 0x2D7F;
 static constexpr uint16_t LCD5B_MUTED_COLOR = 0x8410;
+static constexpr uint8_t LCD5B_BACKLIGHT_PWM_GPIO = 43;
+static constexpr uint32_t LCD5B_BACKLIGHT_PWM_HZ = 30000;
+static constexpr uint8_t LCD5B_BACKLIGHT_PWM_RESOLUTION = 10;
 
 // The LCD uses a four-color status canvas plus native-resolution JPEG artwork.
 // Frames are rendered into the inactive RGB565 framebuffer and selected at a
@@ -86,6 +89,20 @@ class LCD5BDisplay : public Adafruit_GFX
             }
             _framebuffers[0] = static_cast<uint16_t *>(first);
             _framebuffers[1] = static_cast<uint16_t *>(second);
+        }
+
+        if (!_backlightPwmInitialized) {
+            _backlightPwmInitialized = ledcAttach(LCD5B_BACKLIGHT_PWM_GPIO,
+                                                  LCD5B_BACKLIGHT_PWM_HZ,
+                                                  LCD5B_BACKLIGHT_PWM_RESOLUTION);
+            if (_backlightPwmInitialized) {
+                setBrightnessPercent(_brightnessPercent);
+                Serial.printf("LCD-5B backlight PWM: GPIO%u at %lu Hz\n",
+                              static_cast<unsigned>(LCD5B_BACKLIGHT_PWM_GPIO),
+                              static_cast<unsigned long>(LCD5B_BACKLIGHT_PWM_HZ));
+            } else {
+                Serial.println("LCD-5B backlight PWM could not attach; using board enable only");
+            }
         }
 
         // Four indexed colors give the status layout a small accent palette
@@ -263,6 +280,22 @@ class LCD5BDisplay : public Adafruit_GFX
     uint32_t lastRasterUs() const { return _lastRasterUs; }
     uint32_t lastPresentWaitUs() const { return _lastPresentWaitUs; }
 
+    bool setBrightnessPercent(uint8_t percent)
+    {
+        if (percent > 100 || !_backlightPwmInitialized) {
+            return false;
+        }
+        const uint32_t maxDuty = (1UL << LCD5B_BACKLIGHT_PWM_RESOLUTION) - 1;
+        const uint32_t duty = (maxDuty * percent + 50) / 100;
+        if (!ledcWrite(LCD5B_BACKLIGHT_PWM_GPIO, duty)) {
+            return false;
+        }
+        _brightnessPercent = percent;
+        return true;
+    }
+
+    uint8_t brightnessPercent() const { return _brightnessPercent; }
+
     void powerDown() {}
 
   private:
@@ -424,6 +457,8 @@ class LCD5BDisplay : public Adafruit_GFX
     bool _callbacksRegistered = false;
     bool _panelInitialized = false;
     bool _initialized = false;
+    bool _backlightPwmInitialized = false;
+    uint8_t _brightnessPercent = 100;
     uint32_t _lastRasterUs = 0;
     uint32_t _lastPresentWaitUs = 0;
 };

@@ -20,6 +20,7 @@ class PanelInfo : public QObject
     Q_PROPERTY(qint16 rssi READ rssi CONSTANT)
     Q_PROPERTY(QString ifaceVersion READ ifaceVersion CONSTANT)
     Q_PROPERTY(bool supported READ supported CONSTANT)
+    Q_PROPERTY(bool lcd5b READ isLcd5b CONSTANT)
 
   public:
     explicit PanelInfo(const QBluetoothDeviceInfo &info, QObject *parent = nullptr)

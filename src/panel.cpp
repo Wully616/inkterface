@@ -23,6 +23,8 @@
     QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a871904" }
 #define ARTWORK_UUID                                                                               \
     QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a871905" }
+#define BACKLIGHT_UUID                                                                             \
+    QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a871906" }
 #define FLUSH_UUID                                                                                 \
     QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a8719FF" }
 
@@ -123,6 +125,8 @@ void Panel::onServiceStateChanged(QLowEnergyService::ServiceState state)
     qDebug() << "Found " << m_service->characteristics().count() << "characteristics!";
     m_sendTimer->start(250);
     m_lastComms = std::chrono::steady_clock::now();
+    m_lastLcdBrightnessSent = -1;
+    sendLcdBrightness();
     // reconcile the panel to our desired state: re-send a running game's frame,
     // or clear a panel that may be stuck showing stale artwork
     reconcileArtwork();
@@ -186,6 +190,28 @@ void Panel::sendArtworkClear()
         m_artQueue.append(QByteArray(1, char(0x03)));
         sendArtwork();
     }
+}
+
+void Panel::sendLcdBrightness()
+{
+    if (!m_device.name().startsWith(u"INKTF-5B-"_s) || !m_service ||
+        m_service->state() != QLowEnergyService::RemoteServiceDiscovered) {
+        return;
+    }
+    const auto characteristic = m_service->characteristic(BACKLIGHT_UUID);
+    if (!characteristic.isValid()) {
+        return; // Older LCD-5B firmware has no PWM brightness command.
+    }
+
+    QSettings settings;
+    settings.sync();
+    const int percent = qBound(0, settings.value(u"lcd5bBrightness"_s, 100).toInt(), 100);
+    if (percent == m_lastLcdBrightnessSent) {
+        return;
+    }
+    m_service->writeCharacteristic(characteristic, QByteArray(1, char(percent)));
+    m_lastLcdBrightnessSent = percent;
+    qDebug() << "sent LCD-5B brightness" << percent << "%";
 }
 
 void Panel::reconcileArtwork()
@@ -423,6 +449,7 @@ void Panel::clearConnection()
     m_connecting = false;
     m_artQueue.clear();
     m_artSending = false;
+    m_lastLcdBrightnessSent = -1;
 }
 
 void Panel::sendState()
@@ -433,6 +460,7 @@ void Panel::sendState()
     if (!m_service || m_service->state() != QLowEnergyService::RemoteServiceDiscovered) {
         return;
     }
+    sendLcdBrightness();
     if (!m_state->dirty()) {
         return;
     }

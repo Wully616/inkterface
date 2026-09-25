@@ -376,11 +376,23 @@ generic 120 MHz settings are not supported by that module. Its LVGL-specific
 memory options do not apply because this firmware uses Adafruit_GFX and a custom
 RGB565 renderer, not LVGL.
 
-The LCD-5B board exposes its backlight through the CH422G `EXIO2` enable output.
-This supports on/off control, but does not provide a direct high-frequency PWM
-pin for dependable variable brightness. The AP3032 backlight driver recommends
-high-frequency PWM dimming; a practical brightness slider would require a
-hardware change or a board revision with the PWM input routed to an ESP32 pin.
+The LCD-5B board exposes its backlight enable through CH422G `EXIO2`; variable
+brightness needs a wire from the AP3032 `CTRL`/PWM point to ESP32-S3 GPIO43. The
+firmware keeps `EXIO2` enabled and drives GPIO43 with 30 kHz LEDC PWM. The
+Steam Machine app's LCD Backlight slider saves its value and sends it over BLE.
+The slider only dims the panel after this hardware mod; an unmodified board
+continues to run at full brightness. GPIO43 is also the board's RS485 receive
+signal, so that input is no longer available while it is used for PWM.
+
+Waveshare's [schematic](https://files.waveshare.com/wiki/ESP32-S3-Touch-LCD-5/ESP32-S3-Touch-LCD-5-Sch.pdf)
+maps GPIO43 to `RS485_RXD` and shows the AP3032 `CTRL` input; the
+[AP3032 datasheet](https://www.diodes.com/datasheet/download/AP3032.pdf)
+recommends PWM above 25 kHz to avoid audible noise.
+A [Home Assistant community report](https://community.home-assistant.io/t/esp32-s3-7inch-capacitive-touch-display-adjust-brightness/771030/21?page=2)
+from an owner of the 5-inch 1024×600 board reports successful GPIO43 dimming.
+Note that the RS485 A/B screw-terminal bus pins are separate from the ESP32's
+GPIO43/RXD signal. Follow the GPIO43 connection in the marked reference image;
+do not assume that the differential A terminal is GPIO43.
 
 The LCD runs at a 21 MHz pixel clock with the configured 1368 × 637 total timing,
 which gives a nominal scan rate of about 24 frames per second. Waveshare's
@@ -400,7 +412,8 @@ firmware with
 The original Steam Machine app image remains BLE-compatible and will continue to
 send its existing monochrome artwork and 30-second telemetry updates. To get
 two-second LCD telemetry updates and full-color, native-resolution game artwork,
-build and install the Steam Machine app from this branch.
+build and install the Steam Machine app from this branch. Its LCD Backlight
+slider is shown for the LCD-5B and remembers the chosen percentage.
 
 1. Flash the board with `pio run -e lcd5b -t upload`, or use the LCD-5B button
    on the browser flasher when that branch's Pages build has been deployed.
