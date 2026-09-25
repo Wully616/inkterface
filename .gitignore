@@ -7,6 +7,10 @@ include/config.h
 .pio/
 sdkconfig.*
 !sdkconfig.defaults*
+!firmware/sdkconfig.lcd5b.defaults
+firmware/sdkconfig.defaults
+firmware/managed_components/
+firmware/.dummy/
 .rcc/
 .qt/
 CMakeFiles/
