@@ -118,7 +118,7 @@ Item {
         VLabel {
             font.pixelSize: 14
             opacity: 0.75
-            text: "Brightness control requires the GPIO43-to-PWM solder mod."
+            text: "Brightness control requires a GPIO6-to-PWM solder jumper."
         }
     }
 

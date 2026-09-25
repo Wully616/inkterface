@@ -15,7 +15,10 @@ static constexpr int16_t LCD5B_WIDTH = 1024;
 static constexpr int16_t LCD5B_HEIGHT = 600;
 static constexpr uint16_t LCD5B_ACCENT_COLOR = 0x2D7F;
 static constexpr uint16_t LCD5B_MUTED_COLOR = 0x8410;
-static constexpr uint8_t LCD5B_BACKLIGHT_PWM_GPIO = 43;
+// GPIO6 is not assigned to an LCD or onboard peripheral in Waveshare's board
+// pin table. GPIO43 is the RS485 transceiver's receiver output (RS485_RXD),
+// not the differential A terminal, so do not repurpose it for backlight PWM.
+static constexpr uint8_t LCD5B_BACKLIGHT_PWM_GPIO = 6;
 static constexpr uint32_t LCD5B_BACKLIGHT_PWM_HZ = 30000;
 static constexpr uint8_t LCD5B_BACKLIGHT_PWM_RESOLUTION = 10;
 

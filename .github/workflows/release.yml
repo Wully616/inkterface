@@ -30,12 +30,31 @@ jobs:
       - name: Build all board variants
         working-directory: firmware
         run: |
-          pio run -e featherv1 -e featherv2 -e lcd5b
+          set -euo pipefail
+
+          # Build each environment explicitly so every merge input is created.
+          pio run -e featherv1
+          pio run -e featherv2
+          pio run -e lcd5b
+
+          for env in featherv1 featherv2 lcd5b; do
+            for image in bootloader.bin partitions.bin firmware.bin; do
+              test -s ".pio/build/$env/$image" || {
+                echo "Missing firmware artifact: .pio/build/$env/$image" >&2
+                exit 1
+              }
+            done
+          done
 
       - name: Merge flashable images
         working-directory: firmware
         run: |
+          set -euo pipefail
           BOOT_APP0=$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin
+          test -s "$BOOT_APP0" || {
+            echo "Missing Arduino boot_app0 image: $BOOT_APP0" >&2
+            exit 1
+          }
           # feather v1 is an esp32-s3, bootloader lives at 0x0
           python -m esptool --chip esp32s3 merge-bin -o inkterface-featherv1.bin \
             0x0 .pio/build/featherv1/bootloader.bin \

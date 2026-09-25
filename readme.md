@@ -377,22 +377,29 @@ memory options do not apply because this firmware uses Adafruit_GFX and a custom
 RGB565 renderer, not LVGL.
 
 The LCD-5B board exposes its backlight enable through CH422G `EXIO2`; variable
-brightness needs a wire from the AP3032 `CTRL`/PWM point to ESP32-S3 GPIO43. The
-firmware keeps `EXIO2` enabled and drives GPIO43 with 30 kHz LEDC PWM. The
+brightness needs a wire from the AP3032 `CTRL`/PWM point to ESP32-S3 GPIO6. The
+firmware keeps `EXIO2` enabled and drives GPIO6 with 30 kHz LEDC PWM. The
 Steam Machine app's LCD Backlight slider saves its value and sends it over BLE.
 The slider only dims the panel after this hardware mod; an unmodified board
-continues to run at full brightness. GPIO43 is also the board's RS485 receive
-signal, so that input is no longer available while it is used for PWM.
+continues to run at full brightness. GPIO6 is not assigned to a peripheral in
+Waveshare's published board pin table. Check the pad against the exact board
+revision before soldering; use the ESP32-S3-WROOM-1 module pad labelled IO6,
+not the RS485 terminal block.
 
 Waveshare's [schematic](https://files.waveshare.com/wiki/ESP32-S3-Touch-LCD-5/ESP32-S3-Touch-LCD-5-Sch.pdf)
-maps GPIO43 to `RS485_RXD` and shows the AP3032 `CTRL` input; the
+shows the AP3032 `CTRL` input and maps ESP32 GPIO43 to `RS485_RXD`. `RS485_RXD`
+is the output of the SP3485 receiver; it is not the RS485 A screw-terminal
+signal. The forum's 5-inch owner reports that their brightness modification
+worked, but their description treats GPIO43/RXD as equivalent to bus A. The
+schematic does not show those as the same net, so this project uses the
+unassigned GPIO6 for PWM instead. Do not connect the AP3032 PWM point to the A/B
+terminals or drive GPIO43 as PWM. The
 [AP3032 datasheet](https://www.diodes.com/datasheet/download/AP3032.pdf)
 recommends PWM above 25 kHz to avoid audible noise.
 A [Home Assistant community report](https://community.home-assistant.io/t/esp32-s3-7inch-capacitive-touch-display-adjust-brightness/771030/21?page=2)
-from an owner of the 5-inch 1024×600 board reports successful GPIO43 dimming.
-Note that the RS485 A/B screw-terminal bus pins are separate from the ESP32's
-GPIO43/RXD signal. Follow the GPIO43 connection in the marked reference image;
-do not assume that the differential A terminal is GPIO43.
+from an owner of the 5-inch 1024×600 board reports successful dimming with
+their wiring. Verify the exact PWM pad and module IO6 pad on your board revision
+before soldering.
 
 The LCD runs at a 21 MHz pixel clock with the configured 1368 × 637 total timing,
 which gives a nominal scan rate of about 24 frames per second. Waveshare's
