@@ -29,20 +29,32 @@ jobs:
 
       - name: Build all board variants
         working-directory: firmware
+        shell: bash
         run: |
           set -euo pipefail
 
-          # Build each environment explicitly so every merge input is created.
-          pio run -e featherv1
-          pio run -e featherv2
-          pio run -e lcd5b
-
           for env in featherv1 featherv2 lcd5b; do
+            echo "Building ${env}"
+            pio run -e "$env" -t buildprog
             for image in bootloader.bin partitions.bin firmware.bin; do
-              test -s ".pio/build/$env/$image" || {
-                echo "Missing firmware artifact: .pio/build/$env/$image" >&2
+              build_dir=".pio/build/$env"
+              canonical_path="${build_dir}/${image}"
+
+              # Accept an image from anywhere under this environment's build
+              # directory, then normalize its path for the merge step below.
+              if [[ ! -s "$canonical_path" ]]; then
+                found_path="$(find "$build_dir" -type f -name "$image" -size +0c -print -quit)"
+                if [[ -n "$found_path" ]]; then
+                  cp "$found_path" "$canonical_path"
+                fi
+              fi
+
+              if [[ ! -s "$canonical_path" ]]; then
+                echo "Missing firmware artifact: $canonical_path" >&2
+                echo "Generated files under ${build_dir}:" >&2
+                find "$build_dir" -maxdepth 5 -type f -print >&2 || true
                 exit 1
-              }
+              fi
             done
           done
 
