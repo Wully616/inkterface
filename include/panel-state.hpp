@@ -265,7 +265,7 @@ class PanelState : public QObject
                           std::bind(&SysStats::getGPUSCLK, m_stats),
                           [](double v) { return u"%1 GHz"_s.arg(QString::number(v, 'f', 1)); });
         registerCollector(u"GPU Memory Clock"_s, u"GPU MCLK"_s, u"GPU memory clock speed in MHz."_s,
-                          std::bind(&SysStats::getGPUSCLK, m_stats),
+                          std::bind(&SysStats::getGPUMCLK, m_stats),
                           [](double v) { return u"%1 MHz"_s.arg(QString::number(v, 'f', 1)); });
         registerCollector(u"GPU Voltage"_s, u"GPU"_s, u"GPU core rail voltage."_s,
                           std::bind(&SysStats::getGPUV, m_stats),
@@ -349,7 +349,10 @@ class PanelState : public QObject
         connect(m_steam, &steam::Steam::appStopped, this, &PanelState::onAppStopped);
         connect(m_steam, &steam::Steam::achievementsUpdated, this,
                 &PanelState::onAchievementsUpdated);
-        connect(m_artwork, &Artwork::frameReady, this, &PanelState::artworkFrame);
+        connect(m_artwork, &Artwork::imageChanged, this, [this] {
+            m_dirty = true;
+            emit dataChanged();
+        });
         m_steam->watchConsoleLog(true);
 
         // TODO: allow configuring different numbers/layouts of fields
@@ -374,6 +377,25 @@ class PanelState : public QObject
     const QString &midLine() const { return m_midLine; }
     const QString &botLine() const { return m_botLine; }
     const QList<PanelField *> fields() const { return m_fields; }
+    QString hostName() const { return m_stats->getHostName(); }
+    QString metricValue(const QString &name) const
+    {
+        const auto collector = m_collectorMap.value(name);
+        return collector ? collector->getStr() : u"--"_s;
+    }
+    bool gameRunning() const { return !m_steam->runningApp().appid.isEmpty(); }
+    QString currentGameTitle() const { return m_steam->runningApp().name; }
+    double currentGamePlaytimeMinutes() const
+    {
+        const auto &app = m_steam->runningApp();
+        return app.appid.isEmpty() ? -1 : m_steam->appPlaytimeMinutes(app.appid);
+    }
+    QPair<int, int> currentGameAchievements() const
+    {
+        return m_steam->achievements(m_steam->runningApp().appid);
+    }
+    QImage currentBoxArt() const { return m_artwork->image(); }
+
     const QList<PanelCollector *> collectors() const { return m_collectors; }
 
     void registerCollector(const QString &displayName, const QString &panelName,
@@ -410,10 +432,9 @@ class PanelState : public QObject
         emit artworkEnabledChanged();
         const auto &app = m_steam->runningApp();
         if (!enabled) {
-            emit artworkClear();
+            m_artwork->clear();
         } else if (!app.appid.isEmpty()) {
-            m_artwork->composeForApp(app, m_steam->appPlaytimeMinutes(app.appid),
-                                     m_steam->achievements(app.appid));
+            m_artwork->requestForApp(app);
         }
     }
 
@@ -439,11 +460,6 @@ class PanelState : public QObject
     void collectorsChanged();
     void artworkEnabledChanged();
     void lcdBacklightOnChanged();
-    // E-paper gets its compact 1bpp frame; LCD-5B gets a native-size JPEG.
-    void artworkFrame(QByteArray monoBits, quint16 monoWidth, quint16 monoHeight,
-                      QByteArray colorJpeg, quint16 colorWidth, quint16 colorHeight);
-    // the panel should fall back to the telemetry layout
-    void artworkClear();
 
   public slots:
     void start() { m_updateTimer->start(); }
@@ -492,23 +508,17 @@ class PanelState : public QObject
     {
         m_steam->fetchAchievements(details.appid);
         if (artworkEnabled()) {
-            m_artwork->composeForApp(details, m_steam->appPlaytimeMinutes(details.appid),
-                                     m_steam->achievements(details.appid));
+            m_artwork->requestForApp(details);
         }
         updateState();
     }
     void onAppStopped([[maybe_unused]] steam::App details)
     {
-        emit artworkClear();
+        m_artwork->clear();
         updateState();
     }
-    void onAchievementsUpdated(QString appid)
+    void onAchievementsUpdated([[maybe_unused]] QString appid)
     {
-        const auto &app = m_steam->runningApp();
-        if (artworkEnabled() && !app.appid.isEmpty() && app.appid == appid) {
-            m_artwork->composeForApp(app, m_steam->appPlaytimeMinutes(app.appid),
-                                     m_steam->achievements(app.appid));
-        }
         updateState();
     }
 

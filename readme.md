@@ -23,14 +23,14 @@ system telemetry readouts.
 
 ## What this fork adds
 
-* **Now Playing artwork mode**: when you launch a game, the panel switches to
-  that game's box art with your total playtime and achievement progress
-  rendered next to it. E-paper panels receive the existing dithered monochrome
-  frame; the Waveshare LCD-5B receives a full-color 1024×600 frame. When you
-  quit, it goes back to the regular telemetry layout. Toggle it with the
-  `Box Art` button in the configure screen.
-* **Game collectors**: `Game Time` and `Achievements` readouts you can put in
-  any panel field, alongside the stock CPU/GPU/fan stats.
+* **Configurable dashboard**: edit normal, in-game, and idle/screensaver layouts
+  separately for e-ink and LCD-5B. Add, move, resize, remove, and configure widgets;
+  changes persist in the app's versioned settings.
+* **Built-in widgets**: hostname, selectable system metrics, Steam box art, current
+  game title, playtime, achievement progress, and a static screensaver. The default
+  in-game layout combines box art with live CPU and memory stats.
+* **Host-rendered frames**: Inkterface composes each dashboard on the host and sends
+  it over BLE as 648×480 monochrome for Feather e-ink or 1024×600 JPEG for LCD-5B.
 * **Browser firmware flasher**: flash a supported Feather or LCD-5B from
   Chrome/Edge at the project's GitHub Pages site — no toolchain install needed.
 * **One-line app install**: paste a single command on your Steam Machine and
@@ -95,11 +95,11 @@ hardware and working from source.
 The Waveshare ESP32-S3-LCD-5B can run Inkterface directly, without the Feather,
 eInk breakout, or eInk panel listed above. It uses an ESP32-S3-WROOM-1-N16R8,
 an ST7262 RGB display at 1024×600, and the CH422G I/O expander for LCD reset
-and backlight control. The LCD firmware draws the status layout on the native
-1024×600 canvas with a four-color palette. Game artwork is composed at native
-resolution on the Steam Machine, JPEG-compressed for BLE, then decoded to
-RGB565 on the panel. Feather firmware and its monochrome artwork protocol are
-unchanged. Touch input is not needed by Inkterface.
+and backlight control. Inkterface renders the complete dashboard on the host and
+sends it over BLE as a 1024×600 color JPEG; LCD firmware decodes it to RGB565.
+The Feather receives 648×480 row-major 1-bit frames over its existing BLE path.
+LCD-5B USB serial remains diagnostic-only; display data stays on BLE. Touch input
+is not needed. Idle backlight shutdown applies only to LCD-5B; e-ink has none.
 
 Waveshare groups the LCD-5B and Touch-LCD-5B in its [resources and
 documents](https://docs.waveshare.com/ESP32-S3-Touch-LCD-5/Resources-And-Documents).
@@ -189,16 +189,47 @@ basics are:
       that will break, no biggie though, you'll just need to re-run it.
     * Once the service is installed it might take 10-20 seconds for it to connect
       to the inkterface, that's fine, it just needs to go through discovery.
-6. Finally you can click any of the readouts to adjust what they display.
-    * We have several stats built in, but if you check out `include/panel-state.hpp`
-      you can add any function that can return a `QString` or `double` and then
-      `registerCollector()` to have it show up in the list.
-      * There are some examples of stateful and idempotent collectors in `SysStats`,
-        they get registered in the `PanelState` constructor.
-7. Exit the configuration app.
-    * The service is lightweight and runs in the background, you only need to
-      run the config software to select a panel or to change what it displays.
+6. In the Dashboard editor, choose Normal, In Game, or Idle and add, drag, resize,
+   remove, or select widgets; configure them in the inspector. Each profile has
+   an independent layout for the selected e-ink or LCD-5B panel.
+7. Set the game-running and idle rule targets, enable state, and priority. Defaults
+   are In Game at priority 100 and Idle at 50, so a game wins when both apply.
+   Idle begins after 300 seconds by default.
+8. The LCD Backlight switch sets the preferred state; idle can temporarily turn an
+   LCD-5B backlight off and restores that preference when activity resumes.
+9. Exit configuration. The service continues in the background; return to edit
+   layouts or panel settings.
 
+
+### Dashboard profiles, activity, and panel frames
+
+Each profile has separate e-ink (648×480) and LCD-5B (1024×600) layouts. The Normal
+profile starts from the saved field%NCollector selections; In Game combines
+box art, title, playtime, achievements, CPU, and memory; Idle starts with a static
+screensaver. GIF and video playback are not included.
+
+Rules can be enabled, assigned a target profile, and ordered by priority; higher
+priority wins and ties retain the first matching rule. The defaults are game-running
+priority 100 and idle priority 50. Idle starts after 300 seconds by default
+(configurable, minimum 30 seconds). The existing artworkEnabled and
+lcd5bBacklightOn preferences are preserved. Dashboard JSON is stored under
+dashboardConfig in QSettings with schema version 1; when no valid dashboard
+exists, the Normal layout is seeded from the saved field selections.
+
+When built with KDE's KF6::IdleTime, Inkterface uses KIdleTime for desktop
+idle detection ([KDE docs](https://develop.kde.org/docs/features/kidletime/)). Without
+that backend, the fallback sees only input events delivered to the Inkterface
+process; it cannot observe global pointer coordinates or activity in other apps.
+This is especially relevant on Wayland, where global pointer position is not a
+portable application API. Desktop-wide idle detection therefore requires a supported
+idle backend; see [Wayland idle notification](https://wayland.app/protocols/ext-idle-notify-v1).
+
+Frames are rendered on the host and sent over the existing BLE artwork protocol.
+Updates are coalesced: e-ink is refreshed at a conservative 30-second cadence while
+the LCD can update every 2 seconds. Idle can turn off only the LCD-5B backlight and
+restores the user's preferred on/off state when activity resumes. USB serial remains
+diagnostic-only; USB frame transport, animated screensavers, mouse-following widgets,
+and Steam Point Shop ownership are out of scope.
 
 ## Building Interface
 

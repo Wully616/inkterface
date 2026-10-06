@@ -53,37 +53,14 @@ Item {
         }
     }
 
+
     ColumnLayout {
-        id: titleLineLayout
+        id: lcdBacklightRow
 
         anchors.left: topRow.left
         anchors.right: topRow.right
         anchors.top: topRow.bottom
         anchors.topMargin: 10
-
-        VLabel {
-            font.bold: true
-            font.pixelSize: 32
-            text: panelState.topLine
-        }
-
-        VLabel {
-            font.pixelSize: 24
-            text: panelState.midLine
-        }
-
-        VLabel {
-            font.pixelSize: 24
-            text: panelState.botLine
-        }
-    }
-
-    ColumnLayout {
-        id: lcdBacklightRow
-
-        anchors.left: titleLineLayout.left
-        anchors.right: titleLineLayout.right
-        anchors.top: titleLineLayout.bottom
         height: visible ? implicitHeight : 0
         spacing: 0
         visible: panel && panel.lcd5b
@@ -110,7 +87,7 @@ Item {
         }
     }
 
-    GridLayout {
+    DashboardEditor {
         id: readoutGrid
 
         anchors.bottom: serviceRect.top
@@ -119,58 +96,7 @@ Item {
         anchors.right: topRow.right
         anchors.top: lcdBacklightRow.bottom
         anchors.topMargin: 10
-        columnSpacing: 10
-        columns: 3
-        rowSpacing: 10
-
-        Repeater {
-            model: panelState.fields.filter(x => x.depth <= 0)
-
-            delegate: VBoxedReadout {
-                Layout.fillWidth: true
-                title: modelData.key || "--"
-                value: modelData.val || "--"
-
-                MouseArea {
-                    anchors.fill: parent
-
-                    onClicked: overlayLoader.setSource("PanelFieldOverlay.qml", {
-                                                           "field": modelData
-                                                       })
-                }
-            }
-        }
-
-        Repeater {
-            model: panelState.fields.filter(x => x.depth > 0)
-
-            delegate: VSparkline {
-                Layout.fillHeight: true
-                Layout.fillWidth: true
-                autoValue: false // don't use last point, we will set manually
-                maxPoints: modelData.depth
-                title: modelData.key || "--"
-                value: modelData.val || "--"
-
-                Component.onCompleted: setPoints(modelData.points)
-
-                Connections {
-                    function onPointsChanged() {
-                        setPoints(modelData.points);
-                    }
-
-                    target: modelData
-                }
-
-                MouseArea {
-                    anchors.fill: parent
-
-                    onClicked: overlayLoader.setSource("PanelFieldOverlay.qml", {
-                                                           "field": modelData
-                                                       })
-                }
-            }
-        }
+        lcd5b: panel && panel.lcd5b
     }
 
     VBevelRect {

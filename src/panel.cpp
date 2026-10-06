@@ -1,4 +1,5 @@
 #include "panel.hpp"
+#include "dashboard.hpp"
 
 #include <QByteArray>
 #include <QCoreApplication>
@@ -6,7 +7,6 @@
 #include <QDebug>
 #include <QObject>
 #include <QUuid>
-#include <utility>
 
 #define SERVICE_UUID                                                                               \
     QUuid { "95c7b479-8e84-4ce7-a121-faf74bf48c84" }
@@ -39,6 +39,16 @@ Panel::Panel(QObject *parent)
     : QObject(parent)
     , m_finder(new PanelFinder(this))
     , m_state(new PanelState(this))
+    , m_dashboard(new Dashboard(m_state, this))
+    , m_frameTransport([this](const QByteArray &packet) {
+        if (!m_service) {
+            return;
+        }
+        const auto characteristic = m_service->characteristic(ARTWORK_UUID);
+        if (characteristic.isValid()) {
+            m_service->writeCharacteristic(characteristic, packet);
+        }
+    })
     , m_connTimer(new QTimer(this))
     , m_sendTimer(new QTimer(this))
 {
@@ -54,10 +64,10 @@ Panel::Panel(QObject *parent)
     connect(m_sendTimer, &QTimer::timeout, this, &Panel::sendState);
     m_sendTimer->start();
 
-    connect(m_state, &PanelState::artworkFrame, this, &Panel::onArtworkFrame);
-    connect(m_state, &PanelState::artworkClear, this, &Panel::onArtworkClear);
     connect(m_state, &PanelState::lcdBacklightOnChanged, this,
             &Panel::sendLcdBacklightState);
+    connect(m_dashboard, &Dashboard::idleChanged, this, &Panel::sendLcdBacklightState);
+    connect(m_dashboard, &Dashboard::revisionChanged, this, &Panel::sendLcdBacklightState);
 }
 
 void Panel::stop()
@@ -124,13 +134,12 @@ void Panel::onServiceStateChanged(QLowEnergyService::ServiceState state)
         return;
     }
     qDebug() << "Found " << m_service->characteristics().count() << "characteristics!";
+    m_frameTransportSupported = m_service->characteristic(ARTWORK_UUID).isValid();
+    m_frameTransport.setReady(m_frameTransportSupported);
     m_sendTimer->start(250);
     m_lastComms = std::chrono::steady_clock::now();
     m_lastLcdBacklightOnSent = -1;
     sendLcdBacklightState();
-    // reconcile the panel to our desired state: re-send a running game's frame,
-    // or clear a panel that may be stuck showing stale artwork
-    reconcileArtwork();
 }
 
 void Panel::onServiceError(QLowEnergyService::ServiceError error)
@@ -144,54 +153,11 @@ void Panel::onServiceCharacteristicWritten(
     const QLowEnergyCharacteristic &characteristic, [[maybe_unused]] const QByteArray &value)
 {
     m_lastComms = std::chrono::steady_clock::now();
-    if (characteristic.uuid() == QBluetoothUuid(ARTWORK_UUID)) {
-        m_artSending = false;
-        if (!m_artQueue.isEmpty()) {
-            m_artQueue.removeFirst();
-        }
-        sendArtwork();
+    if (m_frameTransportSupported && characteristic.uuid() == QBluetoothUuid(ARTWORK_UUID)) {
+        m_frameTransport.writeCompleted();
     }
 }
 
-void Panel::onArtworkFrame(QByteArray monoBits, quint16 monoWidth, quint16 monoHeight,
-                           QByteArray colorJpeg, quint16 colorWidth, quint16 colorHeight)
-{
-    m_pendingArtBits = std::move(monoBits);
-    m_pendingArtWidth = monoWidth;
-    m_pendingArtHeight = monoHeight;
-    m_pendingColorArtJpeg = std::move(colorJpeg);
-    m_pendingColorArtWidth = colorWidth;
-    m_pendingColorArtHeight = colorHeight;
-    m_artworkActive = true;
-    queueArtworkFrame();
-}
-
-void Panel::onArtworkClear()
-{
-    m_pendingArtBits.clear();
-    m_pendingArtWidth = 0;
-    m_pendingArtHeight = 0;
-    m_artworkActive = false;
-    sendArtworkClear();
-}
-
-void Panel::sendArtworkClear()
-{
-    m_artQueue.clear();
-    m_artSending = false;
-    m_pendingArtBits.clear();
-    m_pendingColorArtJpeg.clear();
-    m_pendingColorArtWidth = 0;
-    m_pendingColorArtHeight = 0;
-    if (!m_service || m_service->state() != QLowEnergyService::RemoteServiceDiscovered) {
-        return;
-    }
-    auto c = m_service->characteristic(ARTWORK_UUID);
-    if (c.isValid()) {
-        m_artQueue.append(QByteArray(1, char(0x03)));
-        sendArtwork();
-    }
-}
 
 void Panel::sendLcdBacklightState()
 {
@@ -204,7 +170,8 @@ void Panel::sendLcdBacklightState()
         return; // Older LCD-5B firmware has no backlight power command.
     }
 
-    const bool enabled = m_state->lcdBacklightOn();
+    const bool idleOff = m_dashboard->isIdle() && m_dashboard->backlightOffOnIdle();
+    const bool enabled = m_state->lcdBacklightOn() && !idleOff;
     if (static_cast<int>(enabled) == m_lastLcdBacklightOnSent) {
         return;
     }
@@ -213,96 +180,6 @@ void Panel::sendLcdBacklightState()
     qDebug() << "sent LCD-5B backlight" << (enabled ? "on" : "off");
 }
 
-void Panel::reconcileArtwork()
-{
-    // a fresh connection may be to a panel that is stuck in artwork mode (e.g.
-    // a clear was dropped while disconnected), so always assert our intent:
-    // re-send the active frame, or clear. The firmware ignores a clear when it
-    // is already showing telemetry, so an idle reconcile costs nothing.
-    if (m_artworkActive && (!m_pendingArtBits.isEmpty() || !m_pendingColorArtJpeg.isEmpty())) {
-        queueArtworkFrame();
-    } else {
-        sendArtworkClear();
-    }
-}
-
-void Panel::queueArtworkFrame()
-{
-    m_artQueue.clear();
-    m_artSending = false;
-    const bool lcd5b = m_device.name().startsWith(u"INKTF-5B-"_s);
-    const bool colorJpeg = lcd5b && !m_pendingColorArtJpeg.isEmpty();
-    const QByteArray &frame = colorJpeg ? m_pendingColorArtJpeg : m_pendingArtBits;
-    const quint16 width = colorJpeg ? m_pendingColorArtWidth : m_pendingArtWidth;
-    const quint16 height = colorJpeg ? m_pendingColorArtHeight : m_pendingArtHeight;
-    if (frame.isEmpty()) {
-        return;
-    }
-    if (!m_service || m_service->state() != QLowEnergyService::RemoteServiceDiscovered) {
-        return;
-    }
-    auto c = m_service->characteristic(ARTWORK_UUID);
-    if (!c.isValid()) {
-        qDebug() << "panel firmware has no artwork support, skipping frame";
-        return;
-    }
-
-    QByteArray begin;
-    begin.append(char(colorJpeg ? 0x04 : 0x00));
-    begin.append(char(width & 0xFF));
-    begin.append(char((width >> 8) & 0xFF));
-    begin.append(char(height & 0xFF));
-    begin.append(char((height >> 8) & 0xFF));
-    if (colorJpeg) {
-        const uint32_t byteCount = static_cast<uint32_t>(frame.size());
-        begin.append(char(byteCount & 0xFF));
-        begin.append(char((byteCount >> 8) & 0xFF));
-        begin.append(char((byteCount >> 16) & 0xFF));
-        begin.append(char((byteCount >> 24) & 0xFF));
-    }
-    m_artQueue.append(begin);
-
-    // 5 bytes of chunk header, 3 bytes of ATT header; Qt's BlueZ backend
-    // often can't report the negotiated MTU and claims the 23-byte minimum,
-    // while the panel firmware always negotiates 256 - and BlueZ splits
-    // oversized writes into long-write procedures transparently anyway, so
-    // a fixed chunk size is both safe and dramatically faster
-    const int chunkSize = 244;
-    for (qsizetype offset = 0; offset < frame.size(); offset += chunkSize) {
-        QByteArray chunk;
-        chunk.append(char(colorJpeg ? 0x05 : 0x01));
-        chunk.append(char(offset & 0xFF));
-        chunk.append(char((offset >> 8) & 0xFF));
-        chunk.append(char((offset >> 16) & 0xFF));
-        chunk.append(char((offset >> 24) & 0xFF));
-        chunk.append(frame.mid(offset, chunkSize));
-        m_artQueue.append(chunk);
-    }
-    m_artQueue.append(QByteArray(1, char(colorJpeg ? 0x06 : 0x02)));
-
-    qDebug() << "queued" << (colorJpeg ? "color JPEG" : "monochrome")
-             << "artwork frame" << width << "x" << height << "(" << frame.size()
-             << "bytes) in" << m_artQueue.size() - 2 << "chunks of" << chunkSize << "bytes";
-    sendArtwork();
-}
-
-void Panel::sendArtwork()
-{
-    if (m_artSending || m_artQueue.isEmpty()) {
-        return;
-    }
-    if (!m_service || m_service->state() != QLowEnergyService::RemoteServiceDiscovered) {
-        m_artQueue.clear();
-        return;
-    }
-    auto c = m_service->characteristic(ARTWORK_UUID);
-    if (!c.isValid()) {
-        m_artQueue.clear();
-        return;
-    }
-    m_artSending = true;
-    m_service->writeCharacteristic(c, m_artQueue.first());
-}
 
 void Panel::writeLine(const QUuid &uuid, const QString &value)
 {
@@ -389,7 +266,7 @@ void Panel::flushDisplay()
 
 void Panel::connCheck()
 {
-    if (m_connecting) {
+    if (m_stopping || m_connecting) {
         return;
     }
     auto panel = m_finder->panel();
@@ -431,6 +308,8 @@ void Panel::connCheck()
 
 void Panel::clearConnection()
 {
+    m_frameTransport.setReady(false);
+    m_frameTransportSupported = false;
     if (m_service) {
         qDebug() << "clearing service";
         m_service->disconnect(this);
@@ -446,8 +325,8 @@ void Panel::clearConnection()
     }
     m_device = QBluetoothDeviceInfo();
     m_connecting = false;
-    m_artQueue.clear();
-    m_artSending = false;
+    m_lastSentFrame = {};
+    m_hasSentFrame = false;
     m_lastLcdBacklightOnSent = -1;
 }
 
@@ -460,6 +339,21 @@ void Panel::sendState()
         return;
     }
     sendLcdBacklightState();
+    if (m_frameTransportSupported) {
+        const bool lcd5b = m_device.name().startsWith(u"INKTF-5B-"_s);
+        PanelFrame frame = m_dashboard->renderFrame(lcd5b);
+        if (!frame.bytes.isEmpty() &&
+            (!m_hasSentFrame || frame.encoding != m_lastSentFrame.encoding ||
+             frame.width != m_lastSentFrame.width || frame.height != m_lastSentFrame.height ||
+             frame.bytes != m_lastSentFrame.bytes)) {
+            m_frameTransport.sendFrame(frame);
+            m_lastSentFrame = frame;
+            m_hasSentFrame = true;
+        }
+        m_sendTimer->setInterval(m_sendInterval);
+        m_sendTimer->start();
+        return;
+    }
     if (!m_state->dirty()) {
         return;
     }

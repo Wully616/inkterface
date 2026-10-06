@@ -19,6 +19,7 @@
 #include "config.h"
 #include "loghandler.hpp"
 #include "panel-finder.hpp"
+#include "dashboard.hpp"
 #include "panel-state.hpp"
 #include "panel.hpp"
 #include "svcmgr.hpp"
@@ -75,6 +76,8 @@ int runUi(int argc, char *argv[])
     ctx->setContextProperty("svcMgr", svcMgr);
 
     PanelState *fs = new PanelState(&app);
+    Dashboard *dashboard = new Dashboard(fs, &app);
+    ctx->setContextProperty("dashboard", dashboard);
     ctx->setContextProperty("panelState", fs);
 
     const QUrl url(u"qrc:/%1/qml/main.qml"_s.arg(QML_URI));
