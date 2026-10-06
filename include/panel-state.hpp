@@ -237,8 +237,8 @@ class PanelState : public QObject
     Q_PROPERTY(QList<PanelCollector *> collectors READ collectors NOTIFY collectorsChanged)
     Q_PROPERTY(bool artworkEnabled READ artworkEnabled WRITE setArtworkEnabled NOTIFY
                    artworkEnabledChanged)
-    Q_PROPERTY(int lcdBrightness READ lcdBrightness WRITE setLcdBrightness NOTIFY
-                   lcdBrightnessChanged)
+    Q_PROPERTY(bool lcdBacklightOn READ lcdBacklightOn WRITE setLcdBacklightOn NOTIFY
+                   lcdBacklightOnChanged)
 
   public:
     explicit PanelState(QObject *parent = nullptr)
@@ -417,21 +417,20 @@ class PanelState : public QObject
         }
     }
 
-    int lcdBrightness() const
+    bool lcdBacklightOn() const
     {
         QSettings settings;
-        return std::clamp(settings.value(u"lcd5bBrightness"_s, 100).toInt(), 0, 100);
+        return settings.value(u"lcd5bBacklightOn"_s, true).toBool();
     }
 
-    void setLcdBrightness(int percent)
+    void setLcdBacklightOn(bool enabled)
     {
-        percent = std::clamp(percent, 0, 100);
-        if (percent == lcdBrightness()) {
+        if (enabled == lcdBacklightOn()) {
             return;
         }
         QSettings settings;
-        settings.setValue(u"lcd5bBrightness"_s, percent);
-        emit lcdBrightnessChanged();
+        settings.setValue(u"lcd5bBacklightOn"_s, enabled);
+        emit lcdBacklightOnChanged();
     }
 
   signals:
@@ -439,7 +438,7 @@ class PanelState : public QObject
     void fieldsChanged();
     void collectorsChanged();
     void artworkEnabledChanged();
-    void lcdBrightnessChanged();
+    void lcdBacklightOnChanged();
     // E-paper gets its compact 1bpp frame; LCD-5B gets a native-size JPEG.
     void artworkFrame(QByteArray monoBits, quint16 monoWidth, quint16 monoHeight,
                       QByteArray colorJpeg, quint16 colorWidth, quint16 colorHeight);

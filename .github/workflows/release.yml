@@ -32,10 +32,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          staged_dir="${RUNNER_TEMP}/inkterface-firmware"
+          mkdir -p "$staged_dir"
 
           for env in featherv1 featherv2 lcd5b; do
             echo "Building ${env}"
             pio run -e "$env" -t buildprog
+            mkdir -p "${staged_dir}/${env}"
             for image in bootloader.bin partitions.bin firmware.bin; do
               build_dir=".pio/build/$env"
               canonical_path="${build_dir}/${image}"
@@ -55,6 +58,10 @@ jobs:
                 find "$build_dir" -maxdepth 5 -type f -print >&2 || true
                 exit 1
               fi
+
+              # Keep each board's complete image set outside .pio/build; a
+              # later environment can change or clean PlatformIO build output.
+              cp "$canonical_path" "${staged_dir}/${env}/${image}"
             done
           done
 
@@ -63,29 +70,30 @@ jobs:
         run: |
           set -euo pipefail
           BOOT_APP0=$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin
+          STAGED_DIR="${RUNNER_TEMP}/inkterface-firmware"
           test -s "$BOOT_APP0" || {
             echo "Missing Arduino boot_app0 image: $BOOT_APP0" >&2
             exit 1
           }
           # feather v1 is an esp32-s3, bootloader lives at 0x0
           python -m esptool --chip esp32s3 merge-bin -o inkterface-featherv1.bin \
-            0x0 .pio/build/featherv1/bootloader.bin \
-            0x8000 .pio/build/featherv1/partitions.bin \
+            0x0 "$STAGED_DIR/featherv1/bootloader.bin" \
+            0x8000 "$STAGED_DIR/featherv1/partitions.bin" \
             0xe000 "$BOOT_APP0" \
-            0x10000 .pio/build/featherv1/firmware.bin
+            0x10000 "$STAGED_DIR/featherv1/firmware.bin"
           # feather v2 is a classic esp32, bootloader lives at 0x1000
           python -m esptool --chip esp32 merge-bin -o inkterface-featherv2.bin \
-            0x1000 .pio/build/featherv2/bootloader.bin \
-            0x8000 .pio/build/featherv2/partitions.bin \
+            0x1000 "$STAGED_DIR/featherv2/bootloader.bin" \
+            0x8000 "$STAGED_DIR/featherv2/partitions.bin" \
             0xe000 "$BOOT_APP0" \
-            0x10000 .pio/build/featherv2/firmware.bin
+            0x10000 "$STAGED_DIR/featherv2/firmware.bin"
           # Waveshare LCD-5B is an ESP32-S3 with 16 MB QIO flash.
           python -m esptool --chip esp32s3 merge-bin --flash-mode qio --flash-size 16MB \
             -o inkterface-lcd5b.bin \
-            0x0 .pio/build/lcd5b/bootloader.bin \
-            0x8000 .pio/build/lcd5b/partitions.bin \
+            0x0 "$STAGED_DIR/lcd5b/bootloader.bin" \
+            0x8000 "$STAGED_DIR/lcd5b/partitions.bin" \
             0xe000 "$BOOT_APP0" \
-            0x10000 .pio/build/lcd5b/firmware.bin
+            0x10000 "$STAGED_DIR/lcd5b/firmware.bin"
 
       - uses: actions/upload-artifact@v4
         with:

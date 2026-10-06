@@ -88,10 +88,10 @@ class Panel : public QObject
     // when a game is running we re-send its frame, otherwise we send a clear
     // in case the panel is stuck in artwork mode from a dropped clear
     bool m_artworkActive = false;
-    int m_lastLcdBrightnessSent = -1;
+    int m_lastLcdBacklightOnSent = -1;
 
     void queueArtworkFrame();
-    void sendLcdBrightness();
+    void sendLcdBacklightState();
     void sendArtworkClear();
     void reconcileArtwork();
     void sendArtwork();

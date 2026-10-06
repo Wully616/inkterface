@@ -5,7 +5,6 @@
 #include <QDataStream>
 #include <QDebug>
 #include <QObject>
-#include <QSettings>
 #include <QUuid>
 #include <utility>
 
@@ -23,8 +22,8 @@
     QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a871904" }
 #define ARTWORK_UUID                                                                               \
     QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a871905" }
-#define BACKLIGHT_UUID                                                                             \
-    QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a871906" }
+#define BACKLIGHT_POWER_UUID                                                                      \
+    QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a871907" }
 #define FLUSH_UUID                                                                                 \
     QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a8719FF" }
 
@@ -57,6 +56,8 @@ Panel::Panel(QObject *parent)
 
     connect(m_state, &PanelState::artworkFrame, this, &Panel::onArtworkFrame);
     connect(m_state, &PanelState::artworkClear, this, &Panel::onArtworkClear);
+    connect(m_state, &PanelState::lcdBacklightOnChanged, this,
+            &Panel::sendLcdBacklightState);
 }
 
 void Panel::stop()
@@ -125,8 +126,8 @@ void Panel::onServiceStateChanged(QLowEnergyService::ServiceState state)
     qDebug() << "Found " << m_service->characteristics().count() << "characteristics!";
     m_sendTimer->start(250);
     m_lastComms = std::chrono::steady_clock::now();
-    m_lastLcdBrightnessSent = -1;
-    sendLcdBrightness();
+    m_lastLcdBacklightOnSent = -1;
+    sendLcdBacklightState();
     // reconcile the panel to our desired state: re-send a running game's frame,
     // or clear a panel that may be stuck showing stale artwork
     reconcileArtwork();
@@ -192,26 +193,24 @@ void Panel::sendArtworkClear()
     }
 }
 
-void Panel::sendLcdBrightness()
+void Panel::sendLcdBacklightState()
 {
     if (!m_device.name().startsWith(u"INKTF-5B-"_s) || !m_service ||
         m_service->state() != QLowEnergyService::RemoteServiceDiscovered) {
         return;
     }
-    const auto characteristic = m_service->characteristic(BACKLIGHT_UUID);
+    const auto characteristic = m_service->characteristic(BACKLIGHT_POWER_UUID);
     if (!characteristic.isValid()) {
-        return; // Older LCD-5B firmware has no PWM brightness command.
+        return; // Older LCD-5B firmware has no backlight power command.
     }
 
-    QSettings settings;
-    settings.sync();
-    const int percent = qBound(0, settings.value(u"lcd5bBrightness"_s, 100).toInt(), 100);
-    if (percent == m_lastLcdBrightnessSent) {
+    const bool enabled = m_state->lcdBacklightOn();
+    if (static_cast<int>(enabled) == m_lastLcdBacklightOnSent) {
         return;
     }
-    m_service->writeCharacteristic(characteristic, QByteArray(1, char(percent)));
-    m_lastLcdBrightnessSent = percent;
-    qDebug() << "sent LCD-5B brightness" << percent << "%";
+    m_service->writeCharacteristic(characteristic, QByteArray(1, char(enabled ? 1 : 0)));
+    m_lastLcdBacklightOnSent = enabled ? 1 : 0;
+    qDebug() << "sent LCD-5B backlight" << (enabled ? "on" : "off");
 }
 
 void Panel::reconcileArtwork()
@@ -449,7 +448,7 @@ void Panel::clearConnection()
     m_connecting = false;
     m_artQueue.clear();
     m_artSending = false;
-    m_lastLcdBrightnessSent = -1;
+    m_lastLcdBacklightOnSent = -1;
 }
 
 void Panel::sendState()
@@ -460,7 +459,7 @@ void Panel::sendState()
     if (!m_service || m_service->state() != QLowEnergyService::RemoteServiceDiscovered) {
         return;
     }
-    sendLcdBrightness();
+    sendLcdBacklightState();
     if (!m_state->dirty()) {
         return;
     }

@@ -33,8 +33,8 @@
 #define ARTWORK_UUID                                                                               \
     NimBLEUUID { "d6f4c07e-4a21-4c69-bd15-43a38a871905" }
 #if defined(INKTERFACE_LCD5B)
-#define BACKLIGHT_UUID                                                                             \
-    NimBLEUUID { "d6f4c07e-4a21-4c69-bd15-43a38a871906" }
+#define BACKLIGHT_POWER_UUID                                                                      \
+    NimBLEUUID { "d6f4c07e-4a21-4c69-bd15-43a38a871907" }
 #endif
 #define FLUSH_UUID                                                                                 \
     NimBLEUUID { "d6f4c07e-4a21-4c69-bd15-43a38a8719FF" }
@@ -574,20 +574,19 @@ class BacklightCallbacks : public NimBLECharacteristicCallbacks
     {
         const std::string value = characteristic->getValue();
         if (value.size() != 1) {
-            Debug.println("ignoring malformed backlight brightness write");
+            Debug.println("ignoring malformed backlight power write");
             return;
         }
-        const uint8_t percent = static_cast<uint8_t>(value[0]);
-        if (percent > 100) {
-            Debug.println("ignoring out-of-range backlight brightness");
+        const uint8_t enabled = static_cast<uint8_t>(value[0]);
+        if (enabled > 1) {
+            Debug.println("ignoring invalid backlight power value");
             return;
         }
-        if (MF_DISPLAY.setBrightnessPercent(percent)) {
-            Debug.print("LCD backlight brightness set to ");
-            Debug.print(percent);
-            Debug.println("%");
+        if (MF_DISPLAY.setBacklightEnabled(enabled != 0)) {
+            Debug.print("LCD backlight ");
+            Debug.println(enabled ? "on" : "off");
         } else {
-            Debug.println("backlight PWM is not initialized");
+            Debug.println("could not update LCD backlight enable output");
         }
     }
 } BACKLIGHT_CALLBACKS; // }}}
@@ -792,7 +791,7 @@ void setup()
     characteristic->setCallbacks(&ARTWORK_CALLBACKS);
 
 #if defined(INKTERFACE_LCD5B)
-    characteristic = service->createCharacteristic(BACKLIGHT_UUID, NIMBLE_PROPERTY::WRITE);
+    characteristic = service->createCharacteristic(BACKLIGHT_POWER_UUID, NIMBLE_PROPERTY::WRITE);
     characteristic->setCallbacks(&BACKLIGHT_CALLBACKS);
 #endif
 

@@ -79,7 +79,7 @@ Item {
     }
 
     ColumnLayout {
-        id: lcdBrightnessRow
+        id: lcdBacklightRow
 
         anchors.left: titleLineLayout.left
         anchors.right: titleLineLayout.right
@@ -96,29 +96,17 @@ Item {
                 text: "LCD Backlight"
             }
 
-            Slider {
-                id: brightnessSlider
+            Switch {
+                id: backlightSwitch
 
-                Layout.fillWidth: true
-                from: 0
-                stepSize: 1
-                to: 100
-                value: panelState.lcdBrightness
+                checked: panelState.lcdBacklightOn
 
-                onMoved: panelState.lcdBrightness = Math.round(value)
+                onToggled: panelState.lcdBacklightOn = checked
             }
 
             VLabel {
-                horizontalAlignment: Text.AlignRight
-                text: `${Math.round(brightnessSlider.value)}%`
-                width: 52
+                text: backlightSwitch.checked ? "On" : "Off"
             }
-        }
-
-        VLabel {
-            font.pixelSize: 14
-            opacity: 0.75
-            text: "Brightness control requires a GPIO6-to-PWM solder jumper."
         }
     }
 
@@ -129,7 +117,7 @@ Item {
         anchors.bottomMargin: 10
         anchors.left: topRow.left
         anchors.right: topRow.right
-        anchors.top: lcdBrightnessRow.bottom
+        anchors.top: lcdBacklightRow.bottom
         anchors.topMargin: 10
         columnSpacing: 10
         columns: 3

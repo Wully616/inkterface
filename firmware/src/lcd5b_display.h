@@ -15,13 +15,6 @@ static constexpr int16_t LCD5B_WIDTH = 1024;
 static constexpr int16_t LCD5B_HEIGHT = 600;
 static constexpr uint16_t LCD5B_ACCENT_COLOR = 0x2D7F;
 static constexpr uint16_t LCD5B_MUTED_COLOR = 0x8410;
-// GPIO6 is not assigned to an LCD or onboard peripheral in Waveshare's board
-// pin table. GPIO43 is the RS485 transceiver's receiver output (RS485_RXD),
-// not the differential A terminal, so do not repurpose it for backlight PWM.
-static constexpr uint8_t LCD5B_BACKLIGHT_PWM_GPIO = 6;
-static constexpr uint32_t LCD5B_BACKLIGHT_PWM_HZ = 30000;
-static constexpr uint8_t LCD5B_BACKLIGHT_PWM_RESOLUTION = 10;
-
 // The LCD uses a four-color status canvas plus native-resolution JPEG artwork.
 // Frames are rendered into the inactive RGB565 framebuffer and selected at a
 // complete RGB frame boundary before the old framebuffer is reused.
@@ -92,20 +85,6 @@ class LCD5BDisplay : public Adafruit_GFX
             }
             _framebuffers[0] = static_cast<uint16_t *>(first);
             _framebuffers[1] = static_cast<uint16_t *>(second);
-        }
-
-        if (!_backlightPwmInitialized) {
-            _backlightPwmInitialized = ledcAttach(LCD5B_BACKLIGHT_PWM_GPIO,
-                                                  LCD5B_BACKLIGHT_PWM_HZ,
-                                                  LCD5B_BACKLIGHT_PWM_RESOLUTION);
-            if (_backlightPwmInitialized) {
-                setBrightnessPercent(_brightnessPercent);
-                Serial.printf("LCD-5B backlight PWM: GPIO%u at %lu Hz\n",
-                              static_cast<unsigned>(LCD5B_BACKLIGHT_PWM_GPIO),
-                              static_cast<unsigned long>(LCD5B_BACKLIGHT_PWM_HZ));
-            } else {
-                Serial.println("LCD-5B backlight PWM could not attach; using board enable only");
-            }
         }
 
         // Four indexed colors give the status layout a small accent palette
@@ -219,8 +198,15 @@ class LCD5BDisplay : public Adafruit_GFX
 
     void display()
     {
+        displayChecked();
+    }
+
+    // Diagnostics can bound the frame wait and report failures over USB.
+    // Normal callers retain the existing blocking display() behaviour.
+    bool displayChecked(TickType_t frameWaitTicks = portMAX_DELAY)
+    {
         if (!_initialized || _canvas == nullptr || _panel == nullptr) {
-            return;
+            return false;
         }
 
         const uint32_t rasterStartUs = micros();
@@ -240,7 +226,7 @@ class LCD5BDisplay : public Adafruit_GFX
             }
         }
         _lastRasterUs = micros() - rasterStartUs;
-        presentFrame(backIndex);
+        return presentFrame(backIndex, frameWaitTicks);
     }
 
     bool displayJpeg(const uint8_t *jpeg, size_t jpegSize)
@@ -283,26 +269,41 @@ class LCD5BDisplay : public Adafruit_GFX
     uint32_t lastRasterUs() const { return _lastRasterUs; }
     uint32_t lastPresentWaitUs() const { return _lastPresentWaitUs; }
 
-    bool setBrightnessPercent(uint8_t percent)
+    bool setBacklightEnabled(bool enabled)
     {
-        if (percent > 100 || !_backlightPwmInitialized) {
+        if (_backlightEnabled == enabled) {
+            return syncBacklightEnable();
+        }
+        const bool previous = _backlightEnabled;
+        _backlightEnabled = enabled;
+        if (!syncBacklightEnable()) {
+            _backlightEnabled = previous;
             return false;
         }
-        const uint32_t maxDuty = (1UL << LCD5B_BACKLIGHT_PWM_RESOLUTION) - 1;
-        const uint32_t duty = (maxDuty * percent + 50) / 100;
-        if (!ledcWrite(LCD5B_BACKLIGHT_PWM_GPIO, duty)) {
-            return false;
-        }
-        _brightnessPercent = percent;
         return true;
     }
-
-    uint8_t brightnessPercent() const { return _brightnessPercent; }
 
     void powerDown() {}
 
   private:
-    bool presentFrame(uint8_t backIndex)
+    bool syncBacklightEnable()
+    {
+        // Do not illuminate an uninitialized frame; EXIO2 is the backlight's
+        // binary enable and remains low until the first complete frame.
+        const bool shouldEnable = _framePresented && _backlightEnabled;
+        if (shouldEnable == _backlightOn) {
+            return true;
+        }
+        const uint8_t mask = shouldEnable ? (_outputMask | (1 << 2))
+                                          : (_outputMask & ~(1 << 2));
+        if (!setExpanderOutputs(mask)) {
+            return false;
+        }
+        _backlightOn = shouldEnable;
+        return true;
+    }
+
+    bool presentFrame(uint8_t backIndex, TickType_t frameWaitTicks = portMAX_DELAY)
     {
         // The driver keeps scanning the current framebuffer while the CPU
         // prepares the other one; only switch after a complete scan boundary.
@@ -320,17 +321,18 @@ class LCD5BDisplay : public Adafruit_GFX
         // completion will wake us instead, which is safe (and costs one frame).
         _frameWaiter = xTaskGetCurrentTaskHandle();
         const uint32_t swapWaitStartUs = micros();
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        const uint32_t notifications = ulTaskNotifyTake(pdTRUE, frameWaitTicks);
         _lastPresentWaitUs = micros() - swapWaitStartUs;
         _frameWaiter = nullptr;
+        if (notifications == 0) {
+            Serial.println("LCD-5B timed out waiting for a complete RGB frame");
+            return false;
+        }
         _frontIndex = backIndex;
 
-        // EXIO2 is the LCD backlight enable. Turn it on only after the first
-        // complete frame has reached a framebuffer.
-        if (!_backlightOn) {
-            _backlightOn = setExpanderOutputs(_outputMask | (1 << 2));
-        }
-        return true;
+        // EXIO2 can enable the backlight once a complete frame is available.
+        _framePresented = true;
+        return syncBacklightEnable();
     }
 
     static constexpr size_t CANVAS_ROW_BYTES = LCD5B_WIDTH / 4;
@@ -455,13 +457,13 @@ class LCD5BDisplay : public Adafruit_GFX
     uint8_t _frontIndex = 0;
     uint8_t _outputMask = 0;
     TaskHandle_t _frameWaiter = nullptr;
+    bool _framePresented = false;
     bool _backlightOn = false;
     bool _canvasInInternalRam = false;
     bool _callbacksRegistered = false;
     bool _panelInitialized = false;
     bool _initialized = false;
-    bool _backlightPwmInitialized = false;
-    uint8_t _brightnessPercent = 100;
+    bool _backlightEnabled = true;
     uint32_t _lastRasterUs = 0;
     uint32_t _lastPresentWaitUs = 0;
 };
