@@ -244,7 +244,10 @@ class LCD5BDisplay : public Adafruit_GFX
         config.outbuf_size = RGB_BUFFER_SIZE;
         config.out_format = JPEG_IMAGE_FORMAT_RGB565;
         config.out_scale = JPEG_IMAGE_SCALE_0;
-        config.flags.swap_color_bytes = 1;
+        // The decoder's default RGB565 byte order matches the little-endian
+        // uint16_t framebuffer consumed by esp_lcd. Swapping here turns every
+        // pixel into a different color (for example, navy becomes purple).
+        config.flags.swap_color_bytes = 0;
 
         esp_jpeg_image_output_t imageInfo = {};
         if (esp_jpeg_get_image_info(&config, &imageInfo) != ESP_OK ||
