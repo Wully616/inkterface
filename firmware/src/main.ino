@@ -322,6 +322,7 @@ struct State { // {{{
 
 void drawStatic();
 void drawArt();
+void drawLowBatt();
 
 class ServerCallbacks : public NimBLEServerCallbacks
 { // {{{
