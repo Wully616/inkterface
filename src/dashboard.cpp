@@ -51,7 +51,6 @@ QRectF cardContents(QPainter &painter, const QRectF &bounds, const QString &titl
                     const DashboardRenderContext &context)
 {
     const QColor background = context.lcd5b ? QColor(u"#202a36"_s) : QColor(Qt::white);
-    const QColor foreground = context.lcd5b ? QColor(u"#f3f6fa"_s) : QColor(u"#111111"_s);
     const QColor muted = context.lcd5b ? QColor(u"#a8b3c2"_s) : QColor(u"#444444"_s);
     const QColor accent = context.lcd5b ? QColor(u"#36cfc9"_s) : QColor(u"#222222"_s);
     const qreal border = qBound<qreal>(1, bounds.width() / 220.0, 3);
