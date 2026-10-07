@@ -571,11 +571,6 @@ Item {
                             Label { text: "Background style" }
                             ComboBox {
                                 Layout.fillWidth: true
-                                model: [
-                                    { name: "color", label: "Solid color" },
-                                    { name: "pattern", label: "Pattern" },
-                                    { name: "image", label: "Image" }
-                                ]
                                 textRole: "label"
                                 valueRole: "name"
                                 model: control.backgroundModes
