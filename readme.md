@@ -208,11 +208,17 @@ profile starts from the saved field%NCollector selections; In Game combines
 box art, title, playtime, achievements, CPU, and memory; Idle starts with a static
 screensaver. GIF and video playback are not included.
 
+The Appearance tab configures a background separately for each layout and screen:
+solid color, dots, grid, diagonal stripes, or an imported image. Widget palettes
+can be set independently to System, Ocean, Sunset, Forest, or Monochrome. LCD-5B
+frames retain color; e-ink frames convert colors to monochrome.
+
 Rules can be enabled, assigned a target profile, and ordered by priority; higher
 priority wins and ties retain the first matching rule. The defaults are game-running
 priority 100 and idle priority 50. Idle starts after 300 seconds by default
-(configurable, minimum 30 seconds). The existing artworkEnabled and
-lcd5bBacklightOn preferences are preserved. Dashboard JSON is stored under
+(configurable, minimum 30 seconds). The LCD-5B preferred-backlight setting is
+preserved; box art is controlled by adding or removing its widget from a layout.
+Dashboard JSON is stored under
 dashboardConfig in QSettings with schema version 1; when no valid dashboard
 exists, the Normal layout is seeded from the saved field selections.
 
@@ -443,8 +449,9 @@ LCD backlight On/Off switch for the LCD-5B.
    e-paper panels keep their 30 second interval.
 3. Enable Bluetooth on the Steam Machine and launch Inkterface. Select the
    matching `INKTF-...` panel. The host name and system telemetry should update.
-4. Enable **Box Art**, launch a Steam game, then quit it. The panel should show
-   the game's artwork while it is running and return to telemetry afterward.
+4. Add the **Game box art** widget to a layout, launch a Steam game, then quit it.
+   The panel should show the game's artwork while it is running and return to
+   the configured layout afterward.
 5. Reset the LCD-5B and check that Inkterface rediscovers it and reconnects.
 
 If the LCD-5B does not appear as a serial port, hold BOOT, connect USB, and

@@ -5,6 +5,8 @@
 #include <vector>
 
 #include <QElapsedTimer>
+#include <QColor>
+#include <QHash>
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -23,8 +25,11 @@ class PanelState;
 struct DashboardRenderContext {
     PanelState *state = nullptr;
     bool lcd5b = false;
-    bool artworkEnabled = true;
     qint64 elapsedMilliseconds = 0;
+    QColor cardBackground;
+    QColor foreground;
+    QColor muted;
+    QColor accent;
 };
 
 class DashboardWidget
@@ -52,11 +57,13 @@ class DashboardRenderer
 {
   public:
     DashboardRenderer(const WidgetRegistry &registry, PanelState *state);
-    PanelFrame render(const QJsonArray &widgets, bool lcd5b, bool artworkEnabled) const;
+    PanelFrame render(const QJsonArray &widgets, bool lcd5b,
+                      const QJsonObject &background) const;
 
   private:
     const WidgetRegistry &m_registry;
     PanelState *m_state = nullptr;
+    mutable QHash<QString, QImage> m_backgroundImages;
     QElapsedTimer m_clock;
 };
 
@@ -87,6 +94,13 @@ class Dashboard : public QObject
 
     Q_INVOKABLE QVariantList widgets(const QString &profile, bool lcd5b) const;
     Q_INVOKABLE QVariantList widgetTypes() const;
+    Q_INVOKABLE QVariantMap background(const QString &profile, bool lcd5b) const;
+    Q_INVOKABLE QString chooseBackgroundImage(bool lcd5b);
+    Q_INVOKABLE QString chooseColor(const QString &initialColor);
+    Q_INVOKABLE void setBackground(const QString &profile, bool lcd5b, const QString &key,
+                                   const QVariant &value);
+    Q_INVOKABLE void setBackgroundImage(const QString &profile, bool lcd5b,
+                                        const QString &imagePath);
     Q_INVOKABLE void addWidget(const QString &profile, bool lcd5b, const QString &type);
     Q_INVOKABLE void removeWidget(const QString &profile, bool lcd5b, const QString &id);
     Q_INVOKABLE void setWidgetBounds(const QString &profile, bool lcd5b, const QString &id,
@@ -118,6 +132,7 @@ class Dashboard : public QObject
     void updateActivity();
     void commitConfiguration();
     QJsonArray widgetsFor(const QString &profile, bool lcd5b) const;
+    QJsonObject backgroundFor(const QString &profile, bool lcd5b) const;
     QJsonObject findRule(const QString &condition) const;
     bool configurationValid(const QJsonObject &configuration) const;
 

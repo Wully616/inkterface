@@ -6,13 +6,21 @@
 
 #include <QBuffer>
 #include <QColor>
+#include <QColorDialog>
+#include <QDebug>
+#include <QDir>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QFont>
 #include <QFontMetrics>
 #include <QImage>
+#include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QPainterPath>
 #include <QSettings>
+#include <QStandardPaths>
+#include <QUrl>
 #include <QUuid>
 
 #include "activity-detector.hpp"
@@ -29,6 +37,55 @@ constexpr int LCD_HEIGHT = 600;
 constexpr int EINK_WIDTH = 648;
 constexpr int EINK_HEIGHT = 480;
 constexpr qsizetype MAX_JPEG_BYTES = 512 * 1024;
+constexpr qint64 MAX_BACKGROUND_PIXELS = 32 * 1024 * 1024;
+
+struct DashboardPalette {
+    QColor cardBackground;
+    QColor foreground;
+    QColor muted;
+    QColor accent;
+};
+
+DashboardPalette paletteFor(const QString &name, bool lcd5b)
+{
+    if (name == u"ocean"_s) {
+        return lcd5b ? DashboardPalette{QColor(u"#102a43"_s), QColor(u"#e0f2fe"_s),
+                                        QColor(u"#9fb3c8"_s), QColor(u"#38bdf8"_s)}
+                     : DashboardPalette{QColor(u"#e6f1f8"_s), QColor(u"#112b38"_s),
+                                        QColor(u"#35596f"_s), QColor(u"#006f9a"_s)};
+    }
+    if (name == u"sunset"_s) {
+        return lcd5b ? DashboardPalette{QColor(u"#3b2032"_s), QColor(u"#fff1e8"_s),
+                                        QColor(u"#f5b8a4"_s), QColor(u"#ffb86b"_s)}
+                     : DashboardPalette{QColor(u"#faeee8"_s), QColor(u"#301c0d"_s),
+                                        QColor(u"#795643"_s), QColor(u"#a64d00"_s)};
+    }
+    if (name == u"forest"_s) {
+        return lcd5b ? DashboardPalette{QColor(u"#1f3028"_s), QColor(u"#f0fff4"_s),
+                                        QColor(u"#a8c3b1"_s), QColor(u"#8bd450"_s)}
+                     : DashboardPalette{QColor(u"#edf3ed"_s), QColor(u"#172417"_s),
+                                        QColor(u"#3b5e3e"_s), QColor(u"#28502c"_s)};
+    }
+    if (name == u"mono"_s) {
+        return lcd5b ? DashboardPalette{QColor(u"#252525"_s), QColor(u"#ffffff"_s),
+                                        QColor(u"#c0c0c0"_s), QColor(u"#ffffff"_s)}
+                     : DashboardPalette{QColor(u"#ffffff"_s), QColor(u"#111111"_s),
+                                        QColor(u"#444444"_s), QColor(u"#222222"_s)};
+    }
+    return lcd5b ? DashboardPalette{QColor(u"#202a36"_s), QColor(u"#f3f6fa"_s),
+                                    QColor(u"#a8b3c2"_s), QColor(u"#36cfc9"_s)}
+                 : DashboardPalette{QColor(Qt::white), QColor(u"#111111"_s),
+                                    QColor(u"#444444"_s), QColor(u"#222222"_s)};
+}
+
+QJsonObject defaultBackground(bool lcd5b)
+{
+    return {{u"mode"_s, u"color"_s},
+            {u"color"_s, lcd5b ? u"#101722"_s : u"#ffffff"_s},
+            {u"pattern"_s, u"dots"_s},
+            {u"patternColor"_s, lcd5b ? u"#36cfc9"_s : u"#aaaaaa"_s},
+            {u"imagePath"_s, QString{}}};
+}
 
 QJsonObject makeWidget(const QString &type, double x, double y, double width, double height,
                        const QVariantMap &settings = {})
@@ -50,30 +107,27 @@ QString variantKey(bool lcd5b)
 QRectF cardContents(QPainter &painter, const QRectF &bounds, const QString &title,
                     const DashboardRenderContext &context)
 {
-    const QColor background = context.lcd5b ? QColor(u"#202a36"_s) : QColor(Qt::white);
-    const QColor muted = context.lcd5b ? QColor(u"#a8b3c2"_s) : QColor(u"#444444"_s);
-    const QColor accent = context.lcd5b ? QColor(u"#36cfc9"_s) : QColor(u"#222222"_s);
     const qreal border = qBound<qreal>(1, bounds.width() / 220.0, 3);
     const qreal padding = qBound<qreal>(5, qMin(bounds.width(), bounds.height()) * 0.07, 18);
     const QRectF card = bounds.adjusted(border, border, -border, -border);
 
     painter.save();
     painter.setRenderHint(QPainter::Antialiasing, context.lcd5b);
-    painter.setPen(QPen(accent, border));
-    painter.setBrush(background);
+    painter.setPen(QPen(context.accent, border));
+    painter.setBrush(context.cardBackground);
     painter.drawRoundedRect(card, context.lcd5b ? 7 : 1, context.lcd5b ? 7 : 1);
 
     const qreal headerHeight = qBound<qreal>(14, card.height() * 0.22, 30);
     QFont labelFont(u"IBM Plex Mono"_s, -1, QFont::Bold);
     labelFont.setPixelSize(qBound(9, qRound(headerHeight * 0.52), 20));
     painter.setFont(labelFont);
-    painter.setPen(muted);
+    painter.setPen(context.muted);
     painter.drawText(QRectF(card.left() + padding, card.top() + padding * 0.35,
                             card.width() - padding * 2, headerHeight),
                      Qt::AlignVCenter | Qt::AlignLeft,
                      QFontMetrics(labelFont).elidedText(title.toUpper(), Qt::ElideRight,
                                                         qMax(0, qRound(card.width() - padding * 2))));
-    painter.setPen(accent);
+    painter.setPen(context.accent);
     painter.drawLine(QPointF(card.left() + padding, card.top() + padding + headerHeight),
                      QPointF(card.right() - padding, card.top() + padding + headerHeight));
     painter.restore();
@@ -95,7 +149,7 @@ class HostnameWidget final : public DashboardWidget
         font.setPixelSize(qBound(12, qRound(content.height() * 0.52), 48));
         painter.save();
         painter.setFont(font);
-        painter.setPen(context.lcd5b ? QColor(u"#f3f6fa"_s) : QColor(u"#111111"_s));
+        painter.setPen(context.foreground);
         painter.drawText(content, Qt::AlignVCenter | Qt::AlignLeft,
                          QFontMetrics(font).elidedText(context.state->hostName(), Qt::ElideRight,
                                                        qMax(0, qRound(content.width()))));
@@ -127,7 +181,7 @@ class MetricWidget final : public DashboardWidget
         valueFont.setPixelSize(qBound(12, qRound(valueRect.height() * 0.58), 42));
         painter.save();
         painter.setFont(valueFont);
-        painter.setPen(context.lcd5b ? QColor(u"#f3f6fa"_s) : QColor(u"#111111"_s));
+        painter.setPen(context.foreground);
         painter.drawText(valueRect, Qt::AlignVCenter | Qt::AlignLeft,
                          QFontMetrics(valueFont).elidedText(value, Qt::ElideRight,
                                                             qMax(0, qRound(valueRect.width()))));
@@ -154,8 +208,7 @@ class MetricWidget final : public DashboardWidget
                             path.lineTo(position);
                         }
                     }
-                    painter.setPen(QPen(context.lcd5b ? QColor(u"#36cfc9"_s)
-                                                        : QColor(u"#333333"_s), 2));
+                    painter.setPen(QPen(context.accent, 2));
                     painter.drawPath(path);
                 }
             }
@@ -177,15 +230,9 @@ class BoxArtWidget final : public DashboardWidget
         const QRectF content = cardContents(painter, bounds, label(), context);
         painter.save();
         painter.setClipRect(content);
-        if (!context.artworkEnabled) {
-            painter.setPen(context.lcd5b ? QColor(u"#a8b3c2"_s) : QColor(u"#555555"_s));
-            painter.drawText(content, Qt::AlignCenter | Qt::TextWordWrap, u"BOX ART OFF"_s);
-            painter.restore();
-            return;
-        }
         const QImage image = context.state->currentBoxArt();
         if (image.isNull()) {
-            painter.setPen(context.lcd5b ? QColor(u"#a8b3c2"_s) : QColor(u"#555555"_s));
+            painter.setPen(context.muted);
             painter.drawText(content, Qt::AlignCenter | Qt::TextWordWrap, u"BOX ART\nNOT AVAILABLE"_s);
             painter.restore();
             return;
@@ -221,7 +268,7 @@ class GameTitleWidget final : public DashboardWidget
         font.setPixelSize(qBound(12, qRound(content.height() * 0.48), 48));
         painter.save();
         painter.setFont(font);
-        painter.setPen(context.lcd5b ? QColor(u"#f3f6fa"_s) : QColor(u"#111111"_s));
+        painter.setPen(context.foreground);
         painter.drawText(content, Qt::AlignLeft | Qt::AlignVCenter | Qt::TextWordWrap,
                          title.isEmpty() ? u"NO GAME RUNNING"_s : title);
         painter.restore();
@@ -246,7 +293,7 @@ class PlaytimeWidget final : public DashboardWidget
         font.setPixelSize(qBound(12, qRound(content.height() * 0.56), 42));
         painter.save();
         painter.setFont(font);
-        painter.setPen(context.lcd5b ? QColor(u"#f3f6fa"_s) : QColor(u"#111111"_s));
+        painter.setPen(context.foreground);
         painter.drawText(content, Qt::AlignVCenter | Qt::AlignLeft, value);
         painter.restore();
     }
@@ -263,8 +310,8 @@ class AchievementsWidget final : public DashboardWidget
     {
         const QRectF content = cardContents(painter, bounds, label(), context);
         const auto achievements = context.state->currentGameAchievements();
-        const QColor foreground = context.lcd5b ? QColor(u"#f3f6fa"_s) : QColor(u"#111111"_s);
-        const QColor accent = context.lcd5b ? QColor(u"#36cfc9"_s) : QColor(u"#222222"_s);
+        const QColor foreground = context.foreground;
+        const QColor accent = context.accent;
         painter.save();
         if (achievements.second <= 0) {
             painter.setPen(foreground);
@@ -303,11 +350,11 @@ class ScreensaverWidget final : public DashboardWidget
     void render(QPainter &painter, const QRectF &bounds, const QVariantMap &settings,
                 const DashboardRenderContext &context) const override
     {
-        const QColor foreground = context.lcd5b ? QColor(u"#f3f6fa"_s) : QColor(u"#111111"_s);
-        const QColor accent = context.lcd5b ? QColor(u"#36cfc9"_s) : QColor(u"#222222"_s);
+        const QColor foreground = context.foreground;
+        const QColor accent = context.accent;
         painter.save();
         painter.setPen(QPen(accent, context.lcd5b ? 3 : 2));
-        painter.setBrush(context.lcd5b ? QColor(u"#101722"_s) : QColor(Qt::white));
+        painter.setBrush(context.cardBackground);
         painter.drawRect(bounds.adjusted(2, 2, -2, -2));
         QFont titleFont(u"IBM Plex Mono"_s, -1, QFont::Bold);
         titleFont.setPixelSize(qBound(18, qRound(bounds.height() * 0.18), 78));
@@ -398,15 +445,81 @@ DashboardRenderer::DashboardRenderer(const WidgetRegistry &registry, PanelState 
 }
 
 PanelFrame DashboardRenderer::render(const QJsonArray &widgets, bool lcd5b,
-                                     bool artworkEnabled) const
+                                     const QJsonObject &background) const
 {
     const QSize size(lcd5b ? LCD_WIDTH : EINK_WIDTH, lcd5b ? LCD_HEIGHT : EINK_HEIGHT);
     QImage image(size, QImage::Format_RGB32);
-    image.fill(lcd5b ? QColor(u"#101722"_s) : QColor(Qt::white));
+    QColor backgroundColor(background.value(u"color"_s).toString());
+    if (!backgroundColor.isValid()) {
+        backgroundColor = lcd5b ? QColor(u"#101722"_s) : QColor(Qt::white);
+    }
+    image.fill(backgroundColor);
+
+    const QString backgroundMode = background.value(u"mode"_s).toString();
+    if (backgroundMode == u"image"_s) {
+        const QString path = background.value(u"imagePath"_s).toString();
+        if (path.isEmpty()) {
+            m_backgroundImages.clear();
+        } else {
+            if (!m_backgroundImages.contains(path)) {
+                m_backgroundImages.clear();
+                m_backgroundImages.insert(path, QImage(path));
+            }
+            const QImage source = m_backgroundImages.value(path);
+            if (!source.isNull()) {
+                const qreal targetAspect = static_cast<qreal>(size.width()) / size.height();
+                const qreal sourceAspect = static_cast<qreal>(source.width()) / source.height();
+                QRect crop(0, 0, source.width(), source.height());
+                if (sourceAspect > targetAspect) {
+                    crop.setWidth(qRound(source.height() * targetAspect));
+                    crop.moveLeft((source.width() - crop.width()) / 2);
+                } else if (sourceAspect < targetAspect) {
+                    crop.setHeight(qRound(source.width() / targetAspect));
+                    crop.moveTop((source.height() - crop.height()) / 2);
+                }
+                const QImage scaled = source.copy(crop).scaled(
+                    size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+                QPainter imagePainter(&image);
+                imagePainter.setRenderHint(QPainter::SmoothPixmapTransform);
+                imagePainter.drawImage(QRect(QPoint(0, 0), size), scaled);
+            }
+        }
+    } else if (backgroundMode == u"pattern"_s) {
+        m_backgroundImages.clear();
+        QColor patternColor(background.value(u"patternColor"_s).toString());
+        if (!patternColor.isValid()) {
+            patternColor = lcd5b ? QColor(u"#36cfc9"_s) : QColor(u"#aaaaaa"_s);
+        }
+        QPainter patternPainter(&image);
+        patternPainter.setRenderHint(QPainter::Antialiasing, lcd5b);
+        patternPainter.setPen(QPen(patternColor, lcd5b ? 1.5 : 1));
+        const QString pattern = background.value(u"pattern"_s).toString();
+        if (pattern == u"dots"_s) {
+            for (int y = 12; y < size.height(); y += 32) {
+                for (int x = 12; x < size.width(); x += 32) {
+                    patternPainter.drawPoint(x, y);
+                }
+            }
+        } else if (pattern == u"grid"_s) {
+            for (int x = 0; x < size.width(); x += 32) {
+                patternPainter.drawLine(x, 0, x, size.height());
+            }
+            for (int y = 0; y < size.height(); y += 32) {
+                patternPainter.drawLine(0, y, size.width(), y);
+            }
+        } else if (pattern == u"stripes"_s) {
+            for (int x = -size.height(); x < size.width(); x += 32) {
+                patternPainter.drawLine(x, 0, x + size.height(), size.height());
+            }
+        }
+    } else {
+        m_backgroundImages.clear();
+    }
+
     QPainter painter(&image);
     painter.setRenderHint(QPainter::TextAntialiasing);
     painter.setRenderHint(QPainter::SmoothPixmapTransform);
-    const DashboardRenderContext context{m_state, lcd5b, artworkEnabled, m_clock.elapsed()};
+    const DashboardPalette defaultPalette = paletteFor(u"system"_s, lcd5b);
     for (const auto &value : widgets) {
         const QJsonObject instance = value.toObject();
         const auto *widget = m_registry.find(instance.value(u"type"_s).toString());
@@ -417,9 +530,18 @@ PanelFrame DashboardRenderer::render(const QJsonArray &widgets, bool lcd5b,
         const qreal y = qBound(0.0, instance.value(u"y"_s).toDouble(), 1.0);
         const qreal width = qBound(0.0, instance.value(u"width"_s).toDouble(), 1.0 - x);
         const qreal height = qBound(0.0, instance.value(u"height"_s).toDouble(), 1.0 - y);
+        const QVariantMap settings = instance.value(u"settings"_s).toObject().toVariantMap();
+        DashboardPalette palette = defaultPalette;
+        const QString paletteName = settings.value(u"palette"_s).toString();
+        if (!paletteName.isEmpty() && paletteName != u"system"_s) {
+            palette = paletteFor(paletteName, lcd5b);
+        }
+        const DashboardRenderContext context{m_state, lcd5b, m_clock.elapsed(),
+                                             palette.cardBackground, palette.foreground,
+                                             palette.muted, palette.accent};
         widget->render(painter, QRectF(x * size.width(), y * size.height(),
                                        width * size.width(), height * size.height()),
-                       instance.value(u"settings"_s).toObject().toVariantMap(), context);
+                       settings, context);
     }
     painter.end();
 
@@ -517,10 +639,16 @@ QJsonObject Dashboard::defaultConfiguration() const
         QJsonObject{{u"condition"_s, u"idle"_s}, {u"profile"_s, u"idle"_s},
                     {u"enabled"_s, true}, {u"priority"_s, 50}},
     };
+    QJsonObject backgrounds;
+    for (const QString &profile : {u"normal"_s, u"inGame"_s, u"idle"_s}) {
+        backgrounds.insert(profile, QJsonObject{{u"eink"_s, defaultBackground(false)},
+                                                {u"lcd5b"_s, defaultBackground(true)}});
+    }
     return {{u"version"_s, DASHBOARD_VERSION},
             {u"idleTimeoutSeconds"_s, 300},
             {u"backlightOffOnIdle"_s, true},
             {u"profiles"_s, profiles},
+            {u"backgrounds"_s, backgrounds},
             {u"rules"_s, rules}};
 }
 
@@ -637,6 +765,160 @@ QJsonArray Dashboard::widgetsFor(const QString &profile, bool lcd5b) const
     const QJsonObject profiles = m_configuration.value(u"profiles"_s).toObject();
     const QJsonObject layout = profiles.value(profile).toObject();
     return safeWidgets(layout.value(variantKey(lcd5b)));
+}
+
+QJsonObject Dashboard::backgroundFor(const QString &profile, bool lcd5b) const
+{
+    QJsonObject defaults = defaultBackground(lcd5b);
+    const QJsonObject backgrounds = m_configuration.value(u"backgrounds"_s).toObject();
+    const QJsonObject profileBackgrounds = backgrounds.value(profile).toObject();
+    const QJsonObject saved = profileBackgrounds.value(variantKey(lcd5b)).toObject();
+    for (auto it = saved.begin(); it != saved.end(); ++it) {
+        defaults.insert(it.key(), it.value());
+    }
+    return defaults;
+}
+
+QVariantMap Dashboard::background(const QString &profile, bool lcd5b) const
+{
+    QVariantMap settings = backgroundFor(profile, lcd5b).toVariantMap();
+    const QString imagePath = settings.value(u"imagePath"_s).toString();
+    settings.insert(u"imageUrl"_s,
+                    imagePath.isEmpty() ? QUrl{} : QUrl::fromLocalFile(imagePath));
+    return settings;
+}
+
+QString Dashboard::chooseBackgroundImage(bool lcd5b)
+{
+    const QString source = QFileDialog::getOpenFileName(
+        nullptr, tr("Choose dashboard background"), QDir::homePath(),
+        tr("Images (*.png *.jpg *.jpeg *.webp *.bmp)"));
+    if (source.isEmpty()) {
+        return {};
+    }
+
+    QImageReader reader(source);
+    reader.setAutoTransform(true);
+    if (!reader.canRead()) {
+        qWarning() << "Could not read dashboard background image:" << source;
+        return {};
+    }
+    const QSize imageSize = reader.size();
+    if (imageSize.isEmpty() ||
+        static_cast<qint64>(imageSize.width()) * imageSize.height() > MAX_BACKGROUND_PIXELS) {
+        qWarning() << "Dashboard background image has an unsupported size:" << source;
+        return {};
+    }
+    const QImage original = reader.read();
+    if (original.isNull()) {
+        qWarning() << "Could not decode dashboard background image:" << source;
+        return {};
+    }
+
+    const QSize targetSize(lcd5b ? LCD_WIDTH : EINK_WIDTH,
+                           lcd5b ? LCD_HEIGHT : EINK_HEIGHT);
+    const qreal targetAspect = static_cast<qreal>(targetSize.width()) / targetSize.height();
+    const qreal sourceAspect = static_cast<qreal>(original.width()) / original.height();
+    QRect crop(0, 0, original.width(), original.height());
+    if (sourceAspect > targetAspect) {
+        crop.setWidth(qRound(original.height() * targetAspect));
+        crop.moveLeft((original.width() - crop.width()) / 2);
+    } else if (sourceAspect < targetAspect) {
+        crop.setHeight(qRound(original.width() / targetAspect));
+        crop.moveTop((original.height() - crop.height()) / 2);
+    }
+    const QImage imported = original.copy(crop).scaled(
+        targetSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+
+    const QString appData = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir directory(appData);
+    if (appData.isEmpty() || !directory.mkpath(u"backgrounds"_s) ||
+        !directory.cd(u"backgrounds"_s)) {
+        qWarning() << "Could not create dashboard background directory:" << appData;
+        return {};
+    }
+
+    const QString destination = directory.filePath(
+        QUuid::createUuid().toString(QUuid::WithoutBraces) + u".png"_s);
+    if (!imported.save(destination, "PNG")) {
+        qWarning() << "Could not save dashboard background image to:" << destination;
+        return {};
+    }
+    return destination;
+}
+
+QString Dashboard::chooseColor(const QString &initialColor)
+{
+    const QColor initial(initialColor);
+    const QColor selected = QColorDialog::getColor(initial.isValid() ? initial : QColor(Qt::white),
+                                                    nullptr, tr("Choose color"));
+    return selected.isValid() ? selected.name(QColor::HexRgb) : QString{};
+}
+
+void Dashboard::setBackground(const QString &profile, bool lcd5b, const QString &key,
+                              const QVariant &value)
+{
+    if (!m_configuration.value(u"profiles"_s).toObject().contains(profile)) {
+        return;
+    }
+
+    QJsonValue jsonValue;
+    if (key == u"mode"_s) {
+        const QString mode = value.toString();
+        if (mode != u"color"_s && mode != u"pattern"_s && mode != u"image"_s) {
+            return;
+        }
+        jsonValue = mode;
+    } else if (key == u"color"_s || key == u"patternColor"_s) {
+        const QColor color(value.toString());
+        if (!color.isValid()) {
+            return;
+        }
+        jsonValue = color.name(QColor::HexRgb);
+    } else if (key == u"pattern"_s) {
+        const QString pattern = value.toString();
+        if (pattern != u"dots"_s && pattern != u"grid"_s && pattern != u"stripes"_s) {
+            return;
+        }
+        jsonValue = pattern;
+    } else {
+        return;
+    }
+
+    QJsonObject backgrounds = m_configuration.value(u"backgrounds"_s).toObject();
+    QJsonObject profileBackgrounds = backgrounds.value(profile).toObject();
+    QJsonObject saved = backgroundFor(profile, lcd5b);
+    if (saved.value(key) == jsonValue) {
+        return;
+    }
+    saved.insert(key, jsonValue);
+    profileBackgrounds.insert(variantKey(lcd5b), saved);
+    backgrounds.insert(profile, profileBackgrounds);
+    m_configuration.insert(u"backgrounds"_s, backgrounds);
+    commitConfiguration();
+}
+
+void Dashboard::setBackgroundImage(const QString &profile, bool lcd5b,
+                                   const QString &imagePath)
+{
+    const QFileInfo imageInfo(imagePath);
+    if (!m_configuration.value(u"profiles"_s).toObject().contains(profile) ||
+        !imageInfo.isFile()) {
+        return;
+    }
+    QJsonObject backgrounds = m_configuration.value(u"backgrounds"_s).toObject();
+    QJsonObject profileBackgrounds = backgrounds.value(profile).toObject();
+    QJsonObject saved = backgroundFor(profile, lcd5b);
+    if (saved.value(u"imagePath"_s).toString() == imagePath &&
+        saved.value(u"mode"_s).toString() == u"image"_s) {
+        return;
+    }
+    saved.insert(u"imagePath"_s, imagePath);
+    saved.insert(u"mode"_s, u"image"_s);
+    profileBackgrounds.insert(variantKey(lcd5b), saved);
+    backgrounds.insert(profile, profileBackgrounds);
+    m_configuration.insert(u"backgrounds"_s, backgrounds);
+    commitConfiguration();
 }
 
 QVariantList Dashboard::widgets(const QString &profile, bool lcd5b) const
@@ -772,11 +1054,19 @@ void Dashboard::setWidgetSetting(const QString &profile, bool lcd5b, const QStri
             continue;
         }
         const auto *widget = m_registry.find(instance.value(u"type"_s).toString());
-        if (!widget || !widget->defaultSettings().contains(key)) {
+        const bool widgetPalette = key == u"palette"_s;
+        if (!widget || (!widgetPalette && !widget->defaultSettings().contains(key))) {
             return;
         }
         QVariant setting = value;
-        if (key == u"collector"_s) {
+        if (widgetPalette) {
+            const QString palette = value.toString();
+            if (palette != u"system"_s && palette != u"ocean"_s && palette != u"sunset"_s &&
+                palette != u"forest"_s && palette != u"mono"_s) {
+                return;
+            }
+            setting = palette;
+        } else if (key == u"collector"_s) {
             bool found = false;
             for (const auto *collector : m_state->collectors()) {
                 found |= collector->displayName() == value.toString();
@@ -928,5 +1218,5 @@ PanelFrame Dashboard::renderFrame(bool lcd5b)
     refreshExternalConfiguration();
     updateRules();
     return m_renderer.render(widgetsFor(m_activeProfile, lcd5b), lcd5b,
-                             m_state->artworkEnabled());
+                             backgroundFor(m_activeProfile, lcd5b));
 }

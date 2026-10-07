@@ -235,8 +235,6 @@ class PanelState : public QObject
     Q_PROPERTY(QString botLine READ botLine NOTIFY dataChanged)
     Q_PROPERTY(QList<PanelField *> fields READ fields NOTIFY fieldsChanged)
     Q_PROPERTY(QList<PanelCollector *> collectors READ collectors NOTIFY collectorsChanged)
-    Q_PROPERTY(bool artworkEnabled READ artworkEnabled WRITE setArtworkEnabled NOTIFY
-                   artworkEnabledChanged)
     Q_PROPERTY(bool lcdBacklightOn READ lcdBacklightOn WRITE setLcdBacklightOn NOTIFY
                    lcdBacklightOnChanged)
 
@@ -417,27 +415,6 @@ class PanelState : public QObject
         emit collectorsChanged();
     }
 
-    bool artworkEnabled() const
-    {
-        QSettings settings;
-        return settings.value(u"artworkEnabled"_s, true).toBool();
-    }
-    void setArtworkEnabled(bool enabled)
-    {
-        if (enabled == artworkEnabled()) {
-            return;
-        }
-        QSettings settings;
-        settings.setValue(u"artworkEnabled"_s, enabled);
-        emit artworkEnabledChanged();
-        const auto &app = m_steam->runningApp();
-        if (!enabled) {
-            m_artwork->clear();
-        } else if (!app.appid.isEmpty()) {
-            m_artwork->requestForApp(app);
-        }
-    }
-
     bool lcdBacklightOn() const
     {
         QSettings settings;
@@ -458,7 +435,6 @@ class PanelState : public QObject
     void dataChanged();
     void fieldsChanged();
     void collectorsChanged();
-    void artworkEnabledChanged();
     void lcdBacklightOnChanged();
 
   public slots:
@@ -507,9 +483,7 @@ class PanelState : public QObject
     void onAppStarted(steam::App details)
     {
         m_steam->fetchAchievements(details.appid);
-        if (artworkEnabled()) {
-            m_artwork->requestForApp(details);
-        }
+        m_artwork->requestForApp(details);
         updateState();
     }
     void onAppStopped([[maybe_unused]] steam::App details)
