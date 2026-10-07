@@ -22,6 +22,8 @@
     QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a871904" }
 #define ARTWORK_UUID                                                                               \
     QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a871905" }
+#define TILE_UPDATE_CAPABILITY_UUID                                                                \
+    QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a871908" }
 #define BACKLIGHT_POWER_UUID                                                                      \
     QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a871907" }
 #define FLUSH_UUID                                                                                 \
@@ -135,6 +137,10 @@ void Panel::onServiceStateChanged(QLowEnergyService::ServiceState state)
     }
     qDebug() << "Found " << m_service->characteristics().count() << "characteristics!";
     m_frameTransportSupported = m_service->characteristic(ARTWORK_UUID).isValid();
+    const bool tileUpdatesSupported =
+        m_service->characteristic(TILE_UPDATE_CAPABILITY_UUID).isValid();
+    m_frameTransport.setTileUpdatesSupported(tileUpdatesSupported);
+    qDebug() << "LCD tile updates supported:" << tileUpdatesSupported;
     m_frameTransport.setReady(m_frameTransportSupported);
     m_sendTimer->start(250);
     m_lastComms = std::chrono::steady_clock::now();
@@ -342,10 +348,15 @@ void Panel::sendState()
     if (m_frameTransportSupported) {
         const bool lcd5b = m_device.name().startsWith(u"INKTF-5B-"_s);
         PanelFrame frame = m_dashboard->renderFrame(lcd5b);
+        const QByteArray &frameContent =
+            lcd5b && !frame.rgb565.isEmpty() ? frame.rgb565 : frame.bytes;
+        const QByteArray &lastFrameContent =
+            lcd5b && !m_lastSentFrame.rgb565.isEmpty() ? m_lastSentFrame.rgb565
+                                                       : m_lastSentFrame.bytes;
         if (!frame.bytes.isEmpty() &&
             (!m_hasSentFrame || frame.encoding != m_lastSentFrame.encoding ||
              frame.width != m_lastSentFrame.width || frame.height != m_lastSentFrame.height ||
-             frame.bytes != m_lastSentFrame.bytes)) {
+             frameContent != lastFrameContent)) {
             m_frameTransport.sendFrame(frame);
             m_lastSentFrame = frame;
             m_hasSentFrame = true;

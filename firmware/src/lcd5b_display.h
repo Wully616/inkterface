@@ -3,6 +3,7 @@
 #include <Adafruit_GFX.h>
 #include <Wire.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <esp_heap_caps.h>
 #include <esp_lcd_panel_ops.h>
@@ -15,9 +16,9 @@ static constexpr int16_t LCD5B_WIDTH = 1024;
 static constexpr int16_t LCD5B_HEIGHT = 600;
 static constexpr uint16_t LCD5B_ACCENT_COLOR = 0x2D7F;
 static constexpr uint16_t LCD5B_MUTED_COLOR = 0x8410;
-// The LCD uses a four-color status canvas plus native-resolution JPEG artwork.
-// Frames are rendered into the inactive RGB565 framebuffer and selected at a
-// complete RGB frame boundary before the old framebuffer is reused.
+// The LCD uses a four-color status canvas plus native-resolution host frames.
+// JPEG keyframes and RGB565 tile updates are rendered into the inactive
+// framebuffer and selected at a complete RGB frame boundary.
 class LCD5BDisplay : public Adafruit_GFX
 {
   public:
@@ -85,6 +86,13 @@ class LCD5BDisplay : public Adafruit_GFX
             }
             _framebuffers[0] = static_cast<uint16_t *>(first);
             _framebuffers[1] = static_cast<uint16_t *>(second);
+        }
+        if (_frameMutex == nullptr) {
+            _frameMutex = xSemaphoreCreateMutex();
+            if (_frameMutex == nullptr) {
+                Serial.println("LCD-5B could not allocate framebuffer mutex");
+                return false;
+            }
         }
 
         // Four indexed colors give the status layout a small accent palette
@@ -208,6 +216,9 @@ class LCD5BDisplay : public Adafruit_GFX
         if (!_initialized || _canvas == nullptr || _panel == nullptr) {
             return false;
         }
+        if (xSemaphoreTake(_frameMutex, portMAX_DELAY) != pdTRUE) {
+            return false;
+        }
 
         const uint32_t rasterStartUs = micros();
         const uint8_t backIndex = 1 - _frontIndex;
@@ -226,12 +237,17 @@ class LCD5BDisplay : public Adafruit_GFX
             }
         }
         _lastRasterUs = micros() - rasterStartUs;
-        return presentFrame(backIndex, frameWaitTicks);
+        const bool presented = presentFrame(backIndex, frameWaitTicks);
+        xSemaphoreGive(_frameMutex);
+        return presented;
     }
 
     bool displayJpeg(const uint8_t *jpeg, size_t jpegSize)
     {
         if (!_initialized || jpeg == nullptr || jpegSize == 0 || _panel == nullptr) {
+            return false;
+        }
+        if (xSemaphoreTake(_frameMutex, portMAX_DELAY) != pdTRUE) {
             return false;
         }
 
@@ -255,6 +271,7 @@ class LCD5BDisplay : public Adafruit_GFX
             Serial.printf("LCD-5B rejected JPEG artwork dimensions %u x %u\n",
                           static_cast<unsigned>(imageInfo.width),
                           static_cast<unsigned>(imageInfo.height));
+            xSemaphoreGive(_frameMutex);
             return false;
         }
 
@@ -264,9 +281,43 @@ class LCD5BDisplay : public Adafruit_GFX
         _lastRasterUs = micros() - decodeStartUs;
         if (error != ESP_OK || imageInfo.output_len != RGB_BUFFER_SIZE) {
             Serial.printf("LCD-5B JPEG decode failed: %s\n", esp_err_to_name(error));
+            xSemaphoreGive(_frameMutex);
             return false;
         }
-        return presentFrame(backIndex);
+        const bool presented = presentFrame(backIndex);
+        xSemaphoreGive(_frameMutex);
+        return presented;
+    }
+
+    bool copyFrontBufferTo(uint16_t *destination, size_t pixelCount)
+    {
+        if (!_initialized || !_framePresented || destination == nullptr ||
+            pixelCount != RGB_PIXEL_COUNT) {
+            return false;
+        }
+        if (xSemaphoreTake(_frameMutex, portMAX_DELAY) != pdTRUE) {
+            return false;
+        }
+        memcpy(destination, _framebuffers[_frontIndex], RGB_BUFFER_SIZE);
+        xSemaphoreGive(_frameMutex);
+        return true;
+    }
+
+    bool displayRgb565(const uint16_t *pixels, size_t pixelCount)
+    {
+        if (!_initialized || pixels == nullptr || pixelCount != RGB_PIXEL_COUNT || _panel == nullptr) {
+            return false;
+        }
+        if (xSemaphoreTake(_frameMutex, portMAX_DELAY) != pdTRUE) {
+            return false;
+        }
+        const uint32_t rasterStartUs = micros();
+        const uint8_t backIndex = 1 - _frontIndex;
+        memcpy(_framebuffers[backIndex], pixels, RGB_BUFFER_SIZE);
+        _lastRasterUs = micros() - rasterStartUs;
+        const bool presented = presentFrame(backIndex);
+        xSemaphoreGive(_frameMutex);
+        return presented;
     }
 
     uint32_t lastRasterUs() const { return _lastRasterUs; }
@@ -455,6 +506,7 @@ class LCD5BDisplay : public Adafruit_GFX
     uint16_t _palette[4];
     uint8_t *_canvas = nullptr;
     uint16_t *_framebuffers[2] = {nullptr, nullptr};
+    SemaphoreHandle_t _frameMutex = nullptr;
     alignas(uint32_t) uint32_t _expandedByteLut[256][2] = {};
     esp_lcd_panel_handle_t _panel = nullptr;
     uint8_t _frontIndex = 0;

@@ -58,8 +58,13 @@ void PanelFinder::onDiscoveryEnded()
         }
         return a->name() < b->name();
     });
-    startDiscovery();
     emit panelsChanged();
+    // Let listeners select a discovered panel before restarting the scan. The
+    // selection path stops discovery while connecting; starting first can race
+    // that stop and leave the agent scanning for the whole BLE session.
+    if (!m_stopping) {
+        startDiscovery();
+    }
 }
 
 void PanelFinder::updatePlaceholder()

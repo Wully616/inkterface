@@ -436,9 +436,11 @@ firmware with
 
 The original Steam Machine app image remains BLE-compatible and will continue to
 send its existing monochrome artwork and 30-second telemetry updates. To get
-two-second LCD telemetry updates and full-color, native-resolution game artwork,
-build and install the Steam Machine app from this branch. It provides a simple
-LCD backlight On/Off switch for the LCD-5B.
+two-second LCD dashboard sampling, full-color artwork, and host-rendered tile
+updates, build and install the Steam Machine app and flash the LCD-5B firmware
+from the same branch. The host sends a full JPEG keyframe on connection and when
+large parts of the image change; smaller changes are sent as 8x8 RGB565 tiles.
+It provides a simple LCD backlight On/Off switch for the LCD-5B.
 
 1. Flash the board with `pio run -e lcd5b -t upload`, or use the LCD-5B button
    on the browser flasher when that branch's Pages build has been deployed.

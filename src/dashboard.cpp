@@ -392,6 +392,25 @@ QByteArray packMono(const QImage &image)
     return bytes;
 }
 
+QByteArray packRgb565(const QImage &image)
+{
+    QByteArray bytes(static_cast<qsizetype>(image.width()) * image.height() * 2, char(0));
+    auto *destination = reinterpret_cast<unsigned char *>(bytes.data());
+    for (int y = 0; y < image.height(); ++y) {
+        const auto *source = reinterpret_cast<const QRgb *>(image.constScanLine(y));
+        for (int x = 0; x < image.width(); ++x) {
+            const QRgb pixel = source[x];
+            const quint16 rgb565 = static_cast<quint16>(((qRed(pixel) >> 3) << 11) |
+                                                        ((qGreen(pixel) >> 2) << 5) |
+                                                        (qBlue(pixel) >> 3));
+            const qsizetype offset = (static_cast<qsizetype>(y) * image.width() + x) * 2;
+            destination[offset] = static_cast<unsigned char>(rgb565 & 0xFF);
+            destination[offset + 1] = static_cast<unsigned char>((rgb565 >> 8) & 0xFF);
+        }
+    }
+    return bytes;
+}
+
 QByteArray encodeJpeg(const QImage &image)
 {
     for (const int quality : {84, 74, 64, 54}) {
@@ -551,6 +570,7 @@ PanelFrame DashboardRenderer::render(const QJsonArray &widgets, bool lcd5b,
     if (lcd5b) {
         frame.encoding = PanelFrame::Encoding::Jpeg;
         frame.bytes = encodeJpeg(image);
+        frame.rgb565 = packRgb565(image);
     } else {
         frame.encoding = PanelFrame::Encoding::Monochrome1bpp;
         frame.bytes = packMono(image);

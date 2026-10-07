@@ -35,6 +35,8 @@
 #if defined(INKTERFACE_LCD5B)
 #define BACKLIGHT_POWER_UUID                                                                      \
     NimBLEUUID { "d6f4c07e-4a21-4c69-bd15-43a38a871907" }
+#define TILE_UPDATE_CAPABILITY_UUID                                                               \
+    NimBLEUUID { "d6f4c07e-4a21-4c69-bd15-43a38a871908" }
 #endif
 #define FLUSH_UUID                                                                                 \
     NimBLEUUID { "d6f4c07e-4a21-4c69-bd15-43a38a8719FF" }
@@ -58,6 +60,27 @@ static uint8_t *ART_BUFFER = nullptr;
 static uint8_t *ART_JPEG_BUFFER = nullptr;
 static uint32_t ART_JPEG_EXPECTED_SIZE = 0;
 static uint32_t ART_JPEG_RECEIVED_SIZE = 0;
+#if defined(INKTERFACE_LCD5B)
+static constexpr uint8_t ART_TILE_SIZE = 8;
+static constexpr size_t ART_TILE_COLUMNS = LCD5B_WIDTH / ART_TILE_SIZE;
+static constexpr size_t ART_TILE_ROWS = LCD5B_HEIGHT / ART_TILE_SIZE;
+static constexpr size_t ART_TILE_COUNT = ART_TILE_COLUMNS * ART_TILE_ROWS;
+static uint16_t *ART_PATCH_BUFFER = nullptr;
+static uint8_t ART_PATCH_TILE_SEEN[ART_TILE_COUNT] = {};
+static uint16_t ART_PATCH_UPDATE_ID = 0;
+static uint16_t ART_PATCH_EXPECTED_TILES = 0;
+static uint16_t ART_PATCH_RECEIVED_TILES = 0;
+
+static bool artPatchBufferReady()
+{
+    if (ART_PATCH_BUFFER != nullptr) {
+        return true;
+    }
+    ART_PATCH_BUFFER = static_cast<uint16_t *>(
+        ps_malloc(static_cast<size_t>(LCD5B_WIDTH) * LCD5B_HEIGHT * sizeof(uint16_t)));
+    return ART_PATCH_BUFFER != nullptr;
+}
+#endif
 
 static bool artBufferReady()
 {
@@ -248,6 +271,8 @@ struct State { // {{{
     // instead of the telemetry layout
     bool artMode = false;
     bool artJpegMode = false;
+    bool artPatchMode = false;
+    bool artPatchReceiving = false;
     uint16_t artWidth = 0;
     uint16_t artHeight = 0;
     uint32_t artJpegSize = 0;
@@ -261,6 +286,8 @@ struct State { // {{{
 
         artMode = false;
         artJpegMode = false;
+        artPatchMode = false;
+        artPatchReceiving = false;
         artWidth = 0;
         artHeight = 0;
         artJpegSize = 0;
@@ -417,7 +444,10 @@ class ArtworkCallbacks : public NimBLECharacteristicCallbacks
     //   0x03 CLEAR: return the display to the telemetry layout
     //   0x04 JPEG_BEGIN: uint16 width, uint16 height, uint32 byte count
     //   0x05 JPEG_DATA:  uint32 byte offset, then JPEG payload bytes
-    //   0x06 JPEG_SHOW:  decode and present the complete native-size color frame
+    //   0x06 JPEG_SHOW: decode and present the complete native-size color frame
+    //   0x07 TILE_BEGIN: width, height, tile size, tile count, update id
+    //   0x08 TILE_DATA: update id, x, y, width, height, little-endian RGB565 pixels
+    //   0x09 TILE_SHOW: update id; atomically present all tiles in the update
     void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &conn) override
     {
         std::string value = characteristic->getValue();
@@ -444,6 +474,8 @@ class ArtworkCallbacks : public NimBLECharacteristicCallbacks
             STATE.artWidth = w;
             STATE.artHeight = h;
             STATE.artJpegMode = false;
+            STATE.artPatchMode = false;
+            STATE.artPatchReceiving = false;
             STATE.artJpegSize = 0;
             memset(ART_BUFFER, 0, ART_BUFFER_SIZE);
             break;
@@ -474,6 +506,8 @@ class ArtworkCallbacks : public NimBLECharacteristicCallbacks
             Debug.println("showing artwork frame");
             STATE.artMode = true;
             STATE.artJpegMode = false;
+            STATE.artPatchMode = false;
+            STATE.artPatchReceiving = false;
             DISP_DEBOUNCE = 100;
             break;
         }
@@ -485,6 +519,8 @@ class ArtworkCallbacks : public NimBLECharacteristicCallbacks
                 Debug.println("leaving artwork mode");
                 STATE.artMode = false;
                 STATE.artJpegMode = false;
+                STATE.artPatchMode = false;
+                STATE.artPatchReceiving = false;
                 DISP_DEBOUNCE = 100;
             }
             break;
@@ -519,6 +555,7 @@ class ArtworkCallbacks : public NimBLECharacteristicCallbacks
             }
             ART_JPEG_EXPECTED_SIZE = byteCount;
             ART_JPEG_RECEIVED_SIZE = 0;
+            STATE.artPatchReceiving = false;
             break;
         }
         case 0x05: {
@@ -552,8 +589,99 @@ class ArtworkCallbacks : public NimBLECharacteristicCallbacks
             STATE.artHeight = LCD5B_HEIGHT;
             STATE.artJpegSize = ART_JPEG_EXPECTED_SIZE;
             STATE.artJpegMode = true;
+            STATE.artPatchMode = false;
+            STATE.artPatchReceiving = false;
             STATE.artMode = true;
             Debug.println("showing full-color JPEG artwork frame");
+            DISP_DEBOUNCE = 100;
+            break;
+        }
+        case 0x07: {
+            if (value.length() < 10) {
+                Debug.println("got short LCD tile begin message");
+                return;
+            }
+            const uint16_t width = data[1] | (data[2] << 8);
+            const uint16_t height = data[3] | (data[4] << 8);
+            const uint8_t tileSize = data[5];
+            const uint16_t tileCount = data[6] | (data[7] << 8);
+            const uint16_t updateId = data[8] | (data[9] << 8);
+            if (width != LCD5B_WIDTH || height != LCD5B_HEIGHT ||
+                tileSize != ART_TILE_SIZE || tileCount == 0 || tileCount > ART_TILE_COUNT ||
+                !STATE.artMode || (!STATE.artJpegMode && !STATE.artPatchMode)) {
+                Debug.println("rejecting unsupported LCD tile update");
+                return;
+            }
+            if (!artPatchBufferReady()) {
+                Debug.println("no PSRAM for LCD tile buffer");
+                return;
+            }
+            STATE.artPatchReceiving = true;
+            if (!beginDisplay() ||
+                !MF_DISPLAY.copyFrontBufferTo(ART_PATCH_BUFFER,
+                                               static_cast<size_t>(LCD5B_WIDTH) * LCD5B_HEIGHT)) {
+                STATE.artPatchReceiving = false;
+                Debug.println("could not prepare LCD framebuffer for tile update");
+                return;
+            }
+            memset(ART_PATCH_TILE_SEEN, 0, sizeof(ART_PATCH_TILE_SEEN));
+            ART_PATCH_UPDATE_ID = updateId;
+            ART_PATCH_EXPECTED_TILES = tileCount;
+            ART_PATCH_RECEIVED_TILES = 0;
+            break;
+        }
+        case 0x08: {
+            if (value.length() < 11 || !STATE.artPatchReceiving || ART_PATCH_BUFFER == nullptr) {
+                Debug.println("ignoring LCD tile data outside an update");
+                return;
+            }
+            const uint16_t updateId = data[1] | (data[2] << 8);
+            const uint16_t x = data[3] | (data[4] << 8);
+            const uint16_t y = data[5] | (data[6] << 8);
+            const uint8_t tileWidth = data[7];
+            const uint8_t tileHeight = data[8];
+            if (updateId != ART_PATCH_UPDATE_ID || tileWidth == 0 || tileHeight == 0 ||
+                x >= LCD5B_WIDTH || y >= LCD5B_HEIGHT || x % ART_TILE_SIZE != 0 ||
+                y % ART_TILE_SIZE != 0 || tileWidth != ART_TILE_SIZE ||
+                tileHeight != ART_TILE_SIZE ||
+                value.length() != 9 + static_cast<size_t>(tileWidth) * tileHeight * 2) {
+                Debug.println("rejecting malformed LCD tile data");
+                STATE.artPatchReceiving = false;
+                return;
+            }
+
+            const size_t tileIndex = (y / ART_TILE_SIZE) * ART_TILE_COLUMNS +
+                                     (x / ART_TILE_SIZE);
+            if (!ART_PATCH_TILE_SEEN[tileIndex]) {
+                ART_PATCH_TILE_SEEN[tileIndex] = 1;
+                ++ART_PATCH_RECEIVED_TILES;
+            }
+            const uint8_t *pixels = data + 9;
+            for (uint8_t row = 0; row < tileHeight; ++row) {
+                uint16_t *destination = ART_PATCH_BUFFER +
+                    static_cast<size_t>(y + row) * LCD5B_WIDTH + x;
+                for (uint8_t column = 0; column < tileWidth; ++column) {
+                    const size_t offset = (static_cast<size_t>(row) * tileWidth + column) * 2;
+                    destination[column] = pixels[offset] |
+                                          (static_cast<uint16_t>(pixels[offset + 1]) << 8);
+                }
+            }
+            break;
+        }
+        case 0x09: {
+            if (value.length() < 3 || !STATE.artPatchReceiving ||
+                (data[1] | (data[2] << 8)) != ART_PATCH_UPDATE_ID ||
+                ART_PATCH_RECEIVED_TILES != ART_PATCH_EXPECTED_TILES) {
+                Debug.println("ignoring incomplete LCD tile update");
+                STATE.artPatchReceiving = false;
+                return;
+            }
+            STATE.artWidth = LCD5B_WIDTH;
+            STATE.artHeight = LCD5B_HEIGHT;
+            STATE.artPatchReceiving = false;
+            STATE.artPatchMode = true;
+            STATE.artJpegMode = false;
+            STATE.artMode = true;
             DISP_DEBOUNCE = 100;
             break;
         }
@@ -791,6 +919,9 @@ void setup()
     characteristic->setCallbacks(&ARTWORK_CALLBACKS);
 
 #if defined(INKTERFACE_LCD5B)
+    characteristic = service->createCharacteristic(TILE_UPDATE_CAPABILITY_UUID,
+                                                   NIMBLE_PROPERTY::READ);
+    characteristic->setValue("tile-v1");
     characteristic = service->createCharacteristic(BACKLIGHT_POWER_UUID, NIMBLE_PROPERTY::WRITE);
     characteristic->setCallbacks(&BACKLIGHT_CALLBACKS);
 #endif
@@ -927,6 +1058,10 @@ void loop()
 
     if (DISP_DEBOUNCE > 0 && DISP_DEBOUNCE > delta) {
         DISP_DEBOUNCE -= delta;
+    } else if (DISP_DEBOUNCE > 0 && STATE.artPatchReceiving) {
+        // Keep the currently presented frame stable while the host is staging
+        // a set of tiles; TILE_SHOW schedules one atomic framebuffer swap.
+        DISP_DEBOUNCE = 0;
     } else if (DISP_DEBOUNCE > 0) {
         Debug.println("drawing to display");
         DISP_DEBOUNCE = 0;
@@ -935,21 +1070,26 @@ void loop()
         uint32_t compositionUs = 0;
 #endif
         beginDisplay();
-        bool jpegPresented = false;
+        bool hostFramePresented = false;
 #if defined(INKTERFACE_LCD5B)
-        if (STATE.artMode && STATE.artJpegMode) {
-            jpegPresented = MF_DISPLAY.displayJpeg(ART_JPEG_BUFFER, STATE.artJpegSize);
-            if (!jpegPresented) {
-                Debug.println("failed to decode or present color artwork; showing telemetry");
-                STATE.artMode = false;
-                STATE.artJpegMode = false;
-            }
+        if (STATE.artMode && STATE.artPatchMode) {
+            hostFramePresented = MF_DISPLAY.displayRgb565(
+                ART_PATCH_BUFFER, static_cast<size_t>(LCD5B_WIDTH) * LCD5B_HEIGHT);
+        } else if (STATE.artMode && STATE.artJpegMode) {
+            hostFramePresented = MF_DISPLAY.displayJpeg(ART_JPEG_BUFFER, STATE.artJpegSize);
+        }
+        if (STATE.artMode && !hostFramePresented &&
+            (STATE.artPatchMode || STATE.artJpegMode)) {
+            Debug.println("failed to present host-rendered frame; showing telemetry");
+            STATE.artMode = false;
+            STATE.artJpegMode = false;
+            STATE.artPatchMode = false;
         }
 #endif
-        if (!jpegPresented) {
+        if (!hostFramePresented) {
             MF_DISPLAY.clearBuffer();
             MF_DISPLAY.fillScreen(BG_COLOR);
-            if (STATE.artMode && !STATE.artJpegMode) {
+            if (STATE.artMode && !STATE.artJpegMode && !STATE.artPatchMode) {
                 drawArt();
             } else {
                 drawStatic();
@@ -961,7 +1101,7 @@ void loop()
         }
 #if defined(INKTERFACE_LCD5B)
         const uint32_t totalUs = micros() - updateStartUs;
-        if (jpegPresented) {
+        if (hostFramePresented) {
             const uint32_t renderUs = MF_DISPLAY.lastRasterUs();
             const uint32_t waitUs = MF_DISPLAY.lastPresentWaitUs();
             compositionUs = totalUs > renderUs + waitUs ? totalUs - renderUs - waitUs : 0;
