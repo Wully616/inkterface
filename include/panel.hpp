@@ -82,4 +82,5 @@ class Panel : public QObject
 
     void sendLcdBacklightState();
 
+};
 #endif /* PANEL_HPP */
