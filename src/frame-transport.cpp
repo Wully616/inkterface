@@ -2,6 +2,7 @@
 
 #include <limits>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
@@ -21,6 +22,37 @@ void appendUint16(QByteArray &bytes, quint16 value)
 {
     bytes.append(char(value & 0xFF));
     bytes.append(char((value >> 8) & 0xFF));
+}
+
+quint32 crc32(const QByteArray &bytes)
+{
+    quint32 crc = 0xFFFFFFFFU;
+    for (const char byte : bytes) {
+        crc ^= static_cast<quint8>(byte);
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc >> 1) ^ ((crc & 1U) ? 0xEDB88320U : 0U);
+        }
+    }
+    return ~crc;
+}
+
+bool isEsp32SerialPort(const QSerialPortInfo &port)
+{
+    if (port.hasVendorIdentifier()) {
+        const quint16 vendor = port.vendorIdentifier();
+        if (vendor == 0x303A || vendor == 0x10C4 || vendor == 0x1A86) {
+            return true;
+        }
+    }
+    const QString description =
+        port.description() + QStringLiteral(" ") + port.manufacturer();
+    return description.contains(QStringLiteral("Espressif"), Qt::CaseInsensitive) ||
+           description.contains(QStringLiteral("ESP32"), Qt::CaseInsensitive) ||
+           description.contains(QStringLiteral("USB JTAG"), Qt::CaseInsensitive) ||
+           description.contains(QStringLiteral("Waveshare"), Qt::CaseInsensitive) ||
+           description.contains(QStringLiteral("CP210"), Qt::CaseInsensitive) ||
+           description.contains(QStringLiteral("CH340"), Qt::CaseInsensitive) ||
+           description.contains(QStringLiteral("CH910"), Qt::CaseInsensitive);
 }
 }
 
@@ -255,4 +287,397 @@ void BleFrameTransport::pump()
     }
     m_inFlight = true;
     m_writer(m_packets.head());
+}
+
+UsbFrameTransport::UsbFrameTransport(QObject *parent)
+    : QObject(parent)
+{
+    m_probeTimer.setSingleShot(true);
+    m_helloTimer.setInterval(250);
+    m_pingTimer.setInterval(15000);
+    m_pingResponseTimer.setSingleShot(true);
+    m_retryTimer.setSingleShot(true);
+    m_frameTimer.setSingleShot(true);
+    connect(&m_probeTimer, &QTimer::timeout, this, &UsbFrameTransport::handleProbeTimeout);
+    connect(&m_helloTimer, &QTimer::timeout, this, &UsbFrameTransport::handleHelloTimer);
+    connect(&m_pingTimer, &QTimer::timeout, this, &UsbFrameTransport::handlePingTimer);
+    connect(&m_pingResponseTimer, &QTimer::timeout, this,
+            &UsbFrameTransport::handlePingResponseTimeout);
+    connect(&m_retryTimer, &QTimer::timeout, this, &UsbFrameTransport::handleRetryTimer);
+    connect(&m_frameTimer, &QTimer::timeout, this, &UsbFrameTransport::handleFrameTimeout);
+}
+
+void UsbFrameTransport::probePanel(const QString &panelName)
+{
+    if (m_expectedPanelName != panelName) {
+        stop();
+        m_expectedPanelName = panelName;
+    }
+    if (m_expectedPanelName.isEmpty()) {
+        return;
+    }
+    m_ready = true;
+    if (!m_connected && !m_probeTimer.isActive() && !m_retryTimer.isActive()) {
+        beginProbeCycle();
+    }
+}
+
+void UsbFrameTransport::stop()
+{
+    m_ready = false;
+    m_probeTimer.stop();
+    m_helloTimer.stop();
+    m_pingTimer.stop();
+    m_pingResponseTimer.stop();
+    m_retryTimer.stop();
+    m_frameTimer.stop();
+    closePort();
+    m_candidates.clear();
+    m_readBuffer.clear();
+    m_writeBuffer.clear();
+    m_writeOffset = 0;
+    m_inFlight = false;
+    m_retryPending = false;
+    m_retryCount = 0;
+    m_hasPendingFrame = false;
+    m_pendingFrame = {};
+    m_inFlightFrame = {};
+}
+
+void UsbFrameTransport::setReady(bool ready)
+{
+    if (ready) {
+        m_ready = true;
+        if (!m_expectedPanelName.isEmpty() && !m_connected) {
+            beginProbeCycle();
+        }
+    } else {
+        stop();
+    }
+}
+
+void UsbFrameTransport::sendFrame(const PanelFrame &frame)
+{
+    if (frame.encoding != PanelFrame::Encoding::Jpeg || frame.bytes.isEmpty() ||
+        frame.width == 0 || frame.height == 0 ||
+        static_cast<quint64>(frame.bytes.size()) > std::numeric_limits<quint32>::max()) {
+        return;
+    }
+    if (!m_ready || !m_connected || m_inFlight || m_retryPending) {
+        m_pendingFrame = frame;
+        m_hasPendingFrame = true;
+        return;
+    }
+    m_retryCount = 0;
+    sendFrameNow(frame);
+}
+
+void UsbFrameTransport::beginProbeCycle()
+{
+    if (!m_ready || m_connected || m_expectedPanelName.isEmpty()) {
+        return;
+    }
+    closePort();
+    m_candidates.clear();
+    for (const auto &candidate : QSerialPortInfo::availablePorts()) {
+        if (isEsp32SerialPort(candidate)) {
+            m_candidates.append(candidate);
+        }
+    }
+    m_candidateIndex = 0;
+    tryNextPort();
+}
+
+void UsbFrameTransport::tryNextPort()
+{
+    m_probeTimer.stop();
+    m_helloTimer.stop();
+    closePort();
+    if (!m_ready) {
+        return;
+    }
+    if (m_candidateIndex >= m_candidates.size()) {
+        m_retryTimer.start(3000);
+        return;
+    }
+
+    const QSerialPortInfo info = m_candidates.at(m_candidateIndex++);
+    m_port = new QSerialPort(info, this);
+    m_port->setBaudRate(QSerialPort::Baud115200);
+    if (!m_port->open(QIODevice::ReadWrite)) {
+        qDebug() << "could not open candidate LCD USB port" << info.portName()
+                 << m_port->errorString();
+        m_port->deleteLater();
+        m_port = nullptr;
+        tryNextPort();
+        return;
+    }
+    connect(m_port, &QSerialPort::readyRead, this, &UsbFrameTransport::handleReadyRead);
+    connect(m_port, &QSerialPort::errorOccurred, this, &UsbFrameTransport::handlePortError);
+    connect(m_port, &QSerialPort::bytesWritten, this, &UsbFrameTransport::handleBytesWritten);
+    qDebug() << "probing LCD USB port" << info.portName();
+    m_readBuffer.clear();
+    sendHello();
+    m_helloTimer.start();
+    m_probeTimer.start(2500);
+}
+
+void UsbFrameTransport::closePort()
+{
+    const bool wasConnected = m_connected;
+    m_connected = false;
+    if (m_port) {
+        disconnect(m_port, nullptr, this, nullptr);
+        m_port->close();
+        m_port->deleteLater();
+        m_port = nullptr;
+    }
+    if (wasConnected) {
+        emit panelConnectionChanged(false);
+    }
+}
+
+void UsbFrameTransport::sendHello()
+{
+    if (m_port && m_port->isOpen() && !m_connected) {
+        m_port->write("INKTF_USB_HELLO\n");
+    }
+}
+
+void UsbFrameTransport::handleReadyRead()
+{
+    if (!m_port) {
+        return;
+    }
+    m_readBuffer.append(m_port->readAll());
+    while (true) {
+        const qsizetype newline = m_readBuffer.indexOf('\n');
+        if (newline < 0) {
+            if (m_readBuffer.size() > 4096) {
+                m_readBuffer.clear();
+            }
+            return;
+        }
+        QByteArray line = m_readBuffer.left(newline).trimmed();
+        m_readBuffer.remove(0, newline + 1);
+        processLine(line);
+    }
+}
+
+void UsbFrameTransport::processLine(const QByteArray &line)
+{
+    static const QByteArray panelPrefix("INKTF_USB_PANEL ");
+    const qsizetype panelPrefixIndex = line.indexOf(panelPrefix);
+    if (panelPrefixIndex >= 0) {
+        const QByteArray panelNameBytes =
+            line.mid(panelPrefixIndex + panelPrefix.size()).split(' ').first();
+        const QString panelName = QString::fromUtf8(panelNameBytes);
+        if (panelName != m_expectedPanelName) {
+            qDebug() << "USB panel identity mismatch:" << panelName << "expected"
+                     << m_expectedPanelName;
+            tryNextPort();
+            return;
+        }
+        m_probeTimer.stop();
+        m_helloTimer.stop();
+        m_retryTimer.stop();
+        m_connected = true;
+        qInfo() << "USB frame transport connected to" << panelName;
+        emit panelConnectionChanged(true);
+        emit linkActivity();
+        m_pingResponseTimer.stop();
+        m_pingTimer.start();
+        if (m_hasPendingFrame && !m_inFlight) {
+            PanelFrame pending = std::move(m_pendingFrame);
+            m_hasPendingFrame = false;
+            m_retryCount = 0;
+            sendFrameNow(pending);
+        }
+        return;
+    }
+    if (line.contains("INKTF_USB_PONG")) {
+        m_pingResponseTimer.stop();
+        emit linkActivity();
+        return;
+    }
+    static const QByteArray ackPrefix("INKTF_USB_ACK ");
+    const qsizetype ackPrefixIndex = line.indexOf(ackPrefix);
+    if (ackPrefixIndex >= 0) {
+        const QList<QByteArray> fields = line.mid(ackPrefixIndex + ackPrefix.size()).split(' ');
+        if (fields.size() >= 2 && m_inFlight &&
+            fields.at(0).toUInt() == m_inFlightSequence) {
+            emit linkActivity();
+            finishFrame(fields.at(1).startsWith("OK"));
+        }
+    }
+}
+
+void UsbFrameTransport::sendFrameNow(const PanelFrame &frame)
+{
+    if (!m_connected || !m_port || !m_port->isOpen()) {
+        m_pendingFrame = frame;
+        m_hasPendingFrame = true;
+        return;
+    }
+    m_pingResponseTimer.stop();
+    m_inFlightFrame = frame;
+    m_inFlight = true;
+    m_inFlightSequence = m_nextSequence++;
+    m_writeOffset = 0;
+    m_writeBuffer = QStringLiteral("INKTF_USB_FRAME %1 %2 %3 %4 %5\n")
+                        .arg(static_cast<qulonglong>(m_inFlightSequence))
+                        .arg(static_cast<qulonglong>(frame.width))
+                        .arg(static_cast<qulonglong>(frame.height))
+                        .arg(static_cast<qulonglong>(frame.bytes.size()))
+                        .arg(static_cast<qulonglong>(crc32(frame.bytes)))
+                        .toLatin1();
+    m_writeBuffer.append(frame.bytes);
+    m_frameTimer.start(45000);
+    qDebug() << "sending LCD JPEG frame over USB" << frame.width << "x" << frame.height
+             << frame.bytes.size() << "bytes";
+    pumpWriteBuffer();
+}
+
+void UsbFrameTransport::pumpWriteBuffer()
+{
+    if (!m_inFlight || !m_port || !m_port->isOpen() ||
+        m_port->bytesToWrite() > 64 * 1024 || m_writeOffset >= m_writeBuffer.size()) {
+        return;
+    }
+    const qsizetype count = qMin<qsizetype>(16 * 1024, m_writeBuffer.size() - m_writeOffset);
+    const qint64 written = m_port->write(m_writeBuffer.constData() + m_writeOffset, count);
+    if (written < 0) {
+        finishFrame(false);
+        return;
+    }
+    m_writeOffset += written;
+    if (written == 0) {
+        return;
+    }
+    if (m_writeOffset < m_writeBuffer.size()) {
+        pumpWriteBuffer();
+    }
+}
+
+void UsbFrameTransport::finishFrame(bool success)
+{
+    if (!m_inFlight) {
+        return;
+    }
+    m_frameTimer.stop();
+    if (!success && m_retryCount == 0 && m_connected) {
+        m_retryCount = 1;
+        m_inFlight = false;
+        m_retryPending = true;
+        m_writeBuffer.clear();
+        m_writeOffset = 0;
+        m_retryTimer.start(250);
+        return;
+    }
+    m_inFlight = false;
+    m_retryPending = false;
+    m_writeBuffer.clear();
+    m_writeOffset = 0;
+    m_inFlightFrame = {};
+    m_retryCount = 0;
+    emit frameFinished(success);
+    if (m_hasPendingFrame && m_connected) {
+        PanelFrame pending = std::move(m_pendingFrame);
+        m_hasPendingFrame = false;
+        sendFrameNow(pending);
+    }
+}
+
+void UsbFrameTransport::handlePortError(QSerialPort::SerialPortError error)
+{
+    if (error == QSerialPort::NoError) {
+        return;
+    }
+    if (error == QSerialPort::ResourceError || error == QSerialPort::DeviceNotFoundError) {
+        qWarning() << "LCD USB serial port disconnected"
+                   << (m_port ? m_port->errorString() : QString());
+        m_probeTimer.stop();
+        m_helloTimer.stop();
+        m_pingTimer.stop();
+        m_pingResponseTimer.stop();
+        m_frameTimer.stop();
+        m_inFlight = false;
+        m_retryPending = false;
+        m_hasPendingFrame = false;
+        m_pendingFrame = {};
+        m_inFlightFrame = {};
+        m_writeBuffer.clear();
+        m_writeOffset = 0;
+        closePort();
+        if (m_ready) {
+            m_retryTimer.start(1000);
+        }
+    }
+}
+
+void UsbFrameTransport::handleProbeTimeout()
+{
+    if (!m_connected) {
+        tryNextPort();
+    }
+}
+
+void UsbFrameTransport::handleHelloTimer()
+{
+    sendHello();
+}
+
+void UsbFrameTransport::handlePingTimer()
+{
+    if (m_connected && m_port && !m_inFlight && !m_retryPending && !m_hasPendingFrame) {
+        if (m_port->write("INKTF_USB_PING\n") >= 0) {
+            m_pingResponseTimer.start(5000);
+        }
+    }
+}
+
+void UsbFrameTransport::handlePingResponseTimeout()
+{
+    if (!m_connected) {
+        return;
+    }
+    qWarning() << "LCD USB panel stopped responding";
+    m_pingTimer.stop();
+    m_frameTimer.stop();
+    m_inFlight = false;
+    m_retryPending = false;
+    m_hasPendingFrame = false;
+    m_inFlightFrame = {};
+    m_pendingFrame = {};
+    m_writeBuffer.clear();
+    m_writeOffset = 0;
+    closePort();
+    if (m_ready) {
+        m_retryTimer.start(1000);
+    }
+}
+
+void UsbFrameTransport::handleRetryTimer()
+{
+    if (!m_ready) {
+        return;
+    }
+    if (m_retryPending && m_connected) {
+        m_retryPending = false;
+        sendFrameNow(m_inFlightFrame);
+        return;
+    }
+    if (!m_connected) {
+        beginProbeCycle();
+    }
+}
+
+void UsbFrameTransport::handleFrameTimeout()
+{
+    finishFrame(false);
+}
+
+void UsbFrameTransport::handleBytesWritten([[maybe_unused]] qint64 bytes)
+{
+    pumpWriteBuffer();
 }

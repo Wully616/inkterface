@@ -53,6 +53,7 @@ Panel::Panel(QObject *parent)
     })
     , m_connTimer(new QTimer(this))
     , m_sendTimer(new QTimer(this))
+    , m_usbFallbackTimer(new QTimer(this))
 {
     connect(m_finder, &PanelFinder::panelsChanged, this, &Panel::connCheck);
 
@@ -66,15 +67,37 @@ Panel::Panel(QObject *parent)
     connect(m_sendTimer, &QTimer::timeout, this, &Panel::sendState);
     m_sendTimer->start();
 
+    m_usbFallbackTimer->setSingleShot(true);
+    connect(m_usbFallbackTimer, &QTimer::timeout, this, &Panel::enableBleFrameFallback);
+    connect(&m_usbFrameTransport, &UsbFrameTransport::panelConnectionChanged, this,
+            &Panel::onUsbPanelConnectionChanged);
+    connect(&m_usbFrameTransport, &UsbFrameTransport::linkActivity, this, [this]() {
+        m_lastComms = std::chrono::steady_clock::now();
+    });
+
     connect(m_state, &PanelState::lcdBacklightOnChanged, this,
             &Panel::sendLcdBacklightState);
     connect(m_dashboard, &Dashboard::idleChanged, this, &Panel::sendLcdBacklightState);
     connect(m_dashboard, &Dashboard::revisionChanged, this, &Panel::sendLcdBacklightState);
 }
 
+Panel::~Panel()
+{
+    m_stopping = true;
+    m_frameTransportSupported = false;
+    m_usbFallbackTimer->stop();
+    m_usbFrameTransport.stop();
+    if (m_controller) {
+        m_controller->disconnectFromDevice();
+    }
+}
+
 void Panel::stop()
 {
     m_stopping = true;
+    m_frameTransportSupported = false;
+    m_usbFallbackTimer->stop();
+    m_usbFrameTransport.stop();
     if (m_controller) {
         m_controller->disconnectFromDevice();
     }
@@ -139,10 +162,28 @@ void Panel::onServiceStateChanged(QLowEnergyService::ServiceState state)
     m_frameTransportSupported = m_service->characteristic(ARTWORK_UUID).isValid();
     const bool tileUpdatesSupported =
         m_service->characteristic(TILE_UPDATE_CAPABILITY_UUID).isValid();
+    m_bleTileUpdatesSupported = tileUpdatesSupported;
     m_frameTransport.setTileUpdatesSupported(tileUpdatesSupported);
     qDebug() << "LCD tile updates supported:" << tileUpdatesSupported;
-    m_frameTransport.setReady(m_frameTransportSupported);
-    m_sendTimer->start(250);
+    const bool lcd5b = m_device.name().startsWith(u"INKTF-5B-"_s);
+    m_bleFrameTransportReady = m_frameTransportSupported && !lcd5b;
+    m_usingUsbFrames = false;
+    m_frameTransport.setReady(m_bleFrameTransportReady);
+    if (lcd5b) {
+        if (m_frameTransportSupported) {
+            m_sendTimer->stop();
+        }
+        qInfo() << "probing USB frame transport for" << m_device.name()
+                << "with BLE fallback";
+        m_usbFrameTransport.probePanel(m_device.name());
+        if (m_frameTransportSupported) {
+            m_usbFallbackTimer->start(2500);
+        } else {
+            m_sendTimer->start(250);
+        }
+    } else {
+        m_sendTimer->start(250);
+    }
     m_lastComms = std::chrono::steady_clock::now();
     m_lastLcdBacklightOnSent = -1;
     sendLcdBacklightState();
@@ -153,6 +194,51 @@ void Panel::onServiceError(QLowEnergyService::ServiceError error)
     qDebug() << "service error:" << error;
     clearConnection();
     m_finder->startDiscovery();
+}
+
+void Panel::enableBleFrameFallback()
+{
+    if (!m_frameTransportSupported || !m_service ||
+        m_service->state() != QLowEnergyService::RemoteServiceDiscovered ||
+        m_usingUsbFrames || m_bleFrameTransportReady) {
+        return;
+    }
+    qInfo() << "USB frame transport unavailable; using BLE frames";
+    m_frameTransport.setTileUpdatesSupported(m_bleTileUpdatesSupported);
+    m_frameTransport.setReady(true);
+    m_bleFrameTransportReady = true;
+    m_lastSentFrame = {};
+    m_hasSentFrame = false;
+    m_sendTimer->start(250);
+    sendState();
+}
+
+void Panel::onUsbPanelConnectionChanged(bool connected)
+{
+    if (m_stopping || !m_device.name().startsWith(u"INKTF-5B-"_s)) {
+        return;
+    }
+    if (connected) {
+        m_usbFallbackTimer->stop();
+        qInfo() << "using USB for LCD frames; BLE remains active for controls";
+        m_usingUsbFrames = true;
+        m_bleFrameTransportReady = false;
+        m_frameTransport.setReady(false);
+    } else if (m_frameTransportSupported && m_service &&
+               m_service->state() == QLowEnergyService::RemoteServiceDiscovered) {
+        m_usingUsbFrames = false;
+        if (!m_bleFrameTransportReady) {
+            enableBleFrameFallback();
+            return;
+        }
+    }
+    m_lastSentFrame = {};
+    m_hasSentFrame = false;
+    if (m_service && m_service->state() == QLowEnergyService::RemoteServiceDiscovered) {
+        m_sendTimer->setInterval(m_sendInterval);
+        m_sendTimer->start(250);
+        sendState();
+    }
 }
 
 void Panel::onServiceCharacteristicWritten(
@@ -284,7 +370,7 @@ void Panel::connCheck()
             qDebug() << "Removing connection, doesn't match.";
             clearConnection();
             m_finder->startDiscovery();
-        } else if (delta > CONN_LOST) {
+        } else if (delta > CONN_LOST && !m_usbFrameTransport.isConnected()) {
             qWarning() << "Connection inactive for" << delta << ", removing!";
             clearConnection();
             m_finder->startDiscovery();
@@ -314,8 +400,13 @@ void Panel::connCheck()
 
 void Panel::clearConnection()
 {
-    m_frameTransport.setReady(false);
     m_frameTransportSupported = false;
+    m_bleFrameTransportReady = false;
+    m_usingUsbFrames = false;
+    m_usbFallbackTimer->stop();
+    m_frameTransport.setReady(false);
+    m_usbFrameTransport.stop();
+    m_bleTileUpdatesSupported = false;
     if (m_service) {
         qDebug() << "clearing service";
         m_service->disconnect(this);
@@ -345,8 +436,11 @@ void Panel::sendState()
         return;
     }
     sendLcdBacklightState();
-    if (m_frameTransportSupported) {
-        const bool lcd5b = m_device.name().startsWith(u"INKTF-5B-"_s);
+    const bool lcd5b = m_device.name().startsWith(u"INKTF-5B-"_s);
+    if (m_frameTransportSupported || (lcd5b && m_usingUsbFrames)) {
+        if (lcd5b && !m_usingUsbFrames && !m_bleFrameTransportReady) {
+            return;
+        }
         PanelFrame frame = m_dashboard->renderFrame(lcd5b);
         const QByteArray &frameContent =
             lcd5b && !frame.rgb565.isEmpty() ? frame.rgb565 : frame.bytes;
@@ -357,7 +451,11 @@ void Panel::sendState()
             (!m_hasSentFrame || frame.encoding != m_lastSentFrame.encoding ||
              frame.width != m_lastSentFrame.width || frame.height != m_lastSentFrame.height ||
              frameContent != lastFrameContent)) {
-            m_frameTransport.sendFrame(frame);
+            if (lcd5b && m_usingUsbFrames) {
+                m_usbFrameTransport.sendFrame(frame);
+            } else {
+                m_frameTransport.sendFrame(frame);
+            }
             m_lastSentFrame = frame;
             m_hasSentFrame = true;
         }

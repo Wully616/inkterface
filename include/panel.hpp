@@ -21,12 +21,7 @@ class Panel : public QObject
 
   public:
     explicit Panel(QObject *parent = nullptr);
-    ~Panel()
-    {
-        if (m_controller) {
-            m_controller->disconnectFromDevice();
-        }
-    }
+    ~Panel();
 
     bool isConnected() const
     {
@@ -50,6 +45,8 @@ class Panel : public QObject
     void onControllerError(QLowEnergyController::Error error);
     void onServiceStateChanged(QLowEnergyService::ServiceState state);
     void onServiceError(QLowEnergyService::ServiceError error);
+    void enableBleFrameFallback();
+    void onUsbPanelConnectionChanged(bool connected);
     void onServiceCharacteristicWritten(const QLowEnergyCharacteristic &characteristic,
                                         const QByteArray &value);
 
@@ -62,12 +59,17 @@ class Panel : public QObject
     PanelState *m_state = nullptr;
     Dashboard *m_dashboard = nullptr;
     BleFrameTransport m_frameTransport;
+    UsbFrameTransport m_usbFrameTransport;
 
     QTimer *m_connTimer = nullptr;
     QTimer *m_sendTimer = nullptr;
+    QTimer *m_usbFallbackTimer = nullptr;
     int m_sendInterval = EINK_SEND_INTERVAL_MS;
     bool m_connecting = false;
     bool m_frameTransportSupported = false;
+    bool m_bleTileUpdatesSupported = false;
+    bool m_bleFrameTransportReady = false;
+    bool m_usingUsbFrames = false;
     bool m_stopping = false;
     std::chrono::time_point<std::chrono::steady_clock> m_lastComms;
 

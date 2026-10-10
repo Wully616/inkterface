@@ -19,6 +19,7 @@ set(QT_MODULES
     Qml
     Quick
     QuickControls2
+    SerialPort
     Widgets
 )
 find_package(Qt6 COMPONENTS ${QT_MODULES} REQUIRED)

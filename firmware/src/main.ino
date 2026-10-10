@@ -2,6 +2,7 @@
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <cstdio>
 
 #include <Adafruit_MAX1704X.h>
 #if defined(INKTERFACE_LCD5B)
@@ -320,9 +321,150 @@ struct State { // {{{
     }
 } STATE; // }}}
 
+#if defined(INKTERFACE_LCD5B)
+static char USB_COMMAND_BUFFER[128] = {};
+static size_t USB_COMMAND_LENGTH = 0;
+static bool USB_RECEIVING_FRAME = false;
+static uint32_t USB_FRAME_SEQUENCE = 0;
+static uint32_t USB_FRAME_SIZE = 0;
+static uint32_t USB_FRAME_RECEIVED = 0;
+static uint32_t USB_FRAME_CRC = 0;
+static unsigned long USB_FRAME_LAST_BYTE_MS = 0;
+static bool USB_DISCARD_FRAME = false;
+static bool USB_FRAME_ACK_PENDING = false;
+static uint32_t USB_FRAME_ACK_SEQUENCE = 0;
+static bool USB_FRAME_ACK_SUCCESS = false;
+
+static uint32_t usbFrameCrc32(const uint8_t *data, size_t size)
+{
+    uint32_t crc = 0xFFFFFFFFU;
+    for (size_t i = 0; i < size; ++i) {
+        crc ^= data[i];
+        for (uint8_t bit = 0; bit < 8; ++bit) {
+            crc = (crc >> 1) ^ ((crc & 1U) ? 0xEDB88320U : 0U);
+        }
+    }
+    return ~crc;
+}
+
+static void processUsbCommand(char *line)
+{
+    if (strcmp(line, "INKTF_USB_HELLO") == 0) {
+        Serial.printf("INKTF_USB_PANEL %s\n", BLE_NAME.c_str());
+        return;
+    }
+    if (strcmp(line, "INKTF_USB_PING") == 0) {
+        Serial.println("INKTF_USB_PONG");
+        return;
+    }
+    unsigned long sequence = 0;
+    unsigned long width = 0;
+    unsigned long height = 0;
+    unsigned long size = 0;
+    unsigned long crc = 0;
+    if (std::sscanf(line, "INKTF_USB_FRAME %lu %lu %lu %lu %lu", &sequence, &width, &height,
+                    &size, &crc) != 5) {
+        return;
+    }
+    if (width != LCD5B_WIDTH || height != LCD5B_HEIGHT || size == 0 ||
+        size > ART_JPEG_MAX_SIZE || USB_FRAME_ACK_PENDING) {
+        Serial.printf("INKTF_USB_ACK %lu FAIL\n", sequence);
+        return;
+    }
+    if (ART_JPEG_BUFFER == nullptr) {
+        ART_JPEG_BUFFER = static_cast<uint8_t *>(ps_malloc(ART_JPEG_MAX_SIZE));
+    }
+    USB_FRAME_SEQUENCE = static_cast<uint32_t>(sequence);
+    USB_FRAME_SIZE = static_cast<uint32_t>(size);
+    USB_FRAME_CRC = static_cast<uint32_t>(crc);
+    USB_FRAME_RECEIVED = 0;
+    USB_FRAME_LAST_BYTE_MS = millis();
+    USB_DISCARD_FRAME = ART_JPEG_BUFFER == nullptr;
+    STATE.artPatchReceiving = true;
+    USB_RECEIVING_FRAME = true;
+}
+
+static void pollUsbFrameTransport()
+{
+    while (Serial.available() > 0) {
+        if (USB_RECEIVING_FRAME) {
+            uint32_t bytesToRead = static_cast<uint32_t>(Serial.available());
+            const uint32_t remaining = USB_FRAME_SIZE - USB_FRAME_RECEIVED;
+            if (bytesToRead > remaining) {
+                bytesToRead = remaining;
+            }
+            uint32_t bytesRead = 0;
+            while (bytesRead < bytesToRead) {
+                const int value = Serial.read();
+                if (value < 0) {
+                    break;
+                }
+                if (!USB_DISCARD_FRAME) {
+                    ART_JPEG_BUFFER[USB_FRAME_RECEIVED] = static_cast<uint8_t>(value);
+                }
+                ++USB_FRAME_RECEIVED;
+                ++bytesRead;
+            }
+            if (bytesRead > 0) {
+                USB_FRAME_LAST_BYTE_MS = millis();
+            }
+            if (USB_FRAME_RECEIVED == USB_FRAME_SIZE) {
+                USB_RECEIVING_FRAME = false;
+                if (!USB_DISCARD_FRAME &&
+                    usbFrameCrc32(ART_JPEG_BUFFER, USB_FRAME_SIZE) == USB_FRAME_CRC) {
+                    STATE.artWidth = LCD5B_WIDTH;
+                    STATE.artHeight = LCD5B_HEIGHT;
+                    STATE.artJpegSize = USB_FRAME_SIZE;
+                    STATE.artJpegMode = true;
+                    STATE.artPatchMode = false;
+                    STATE.artPatchReceiving = false;
+                    STATE.artMode = true;
+                    USB_FRAME_ACK_SEQUENCE = USB_FRAME_SEQUENCE;
+                    USB_FRAME_ACK_SUCCESS = false;
+                    USB_FRAME_ACK_PENDING = true;
+                    DISP_DEBOUNCE = 100;
+                } else {
+                    STATE.artPatchReceiving = false;
+                    Serial.printf("INKTF_USB_ACK %lu FAIL\n",
+                                  static_cast<unsigned long>(USB_FRAME_SEQUENCE));
+                }
+                USB_FRAME_SIZE = 0;
+                USB_FRAME_RECEIVED = 0;
+                USB_DISCARD_FRAME = false;
+            }
+            continue;
+        }
+
+        const char value = static_cast<char>(Serial.read());
+        if (value == '\r') {
+            continue;
+        }
+        if (value == '\n') {
+            USB_COMMAND_BUFFER[USB_COMMAND_LENGTH] = '\0';
+            processUsbCommand(USB_COMMAND_BUFFER);
+            USB_COMMAND_LENGTH = 0;
+        } else if (USB_COMMAND_LENGTH + 1 < sizeof(USB_COMMAND_BUFFER)) {
+            USB_COMMAND_BUFFER[USB_COMMAND_LENGTH++] = value;
+        } else {
+            USB_COMMAND_LENGTH = 0;
+        }
+    }
+    if (USB_RECEIVING_FRAME && millis() - USB_FRAME_LAST_BYTE_MS > 15000) {
+        USB_RECEIVING_FRAME = false;
+        STATE.artPatchReceiving = false;
+        Serial.printf("INKTF_USB_ACK %lu FAIL\n",
+                      static_cast<unsigned long>(USB_FRAME_SEQUENCE));
+        USB_FRAME_SIZE = 0;
+        USB_FRAME_RECEIVED = 0;
+        USB_DISCARD_FRAME = false;
+    }
+}
+#endif
+
 void drawStatic();
 void drawArt();
 void drawLowBatt();
+void drawConnectionScreen();
 
 class ServerCallbacks : public NimBLEServerCallbacks
 { // {{{
@@ -985,6 +1127,10 @@ void loop()
     return;
 #endif
 
+#if defined(INKTERFACE_LCD5B)
+    pollUsbFrameTransport();
+#endif
+
     static unsigned long LAST_MS = 0;
     static unsigned long CONN_DEBOUNCE = 5000;
     static unsigned long BATT_DEBOUNCE = 1000;
@@ -1114,6 +1260,15 @@ void loop()
                       static_cast<unsigned long>(totalUs));
 #endif
         MF_DISPLAY.powerDown();
+#if defined(INKTERFACE_LCD5B)
+        if (USB_FRAME_ACK_PENDING) {
+            USB_FRAME_ACK_SUCCESS = hostFramePresented;
+            Serial.printf("INKTF_USB_ACK %lu %s\n",
+                          static_cast<unsigned long>(USB_FRAME_ACK_SEQUENCE),
+                          USB_FRAME_ACK_SUCCESS ? "OK" : "FAIL");
+            USB_FRAME_ACK_PENDING = false;
+        }
+#endif
         Debug.println("drew to display");
     }
 
@@ -1156,6 +1311,50 @@ void drawLogo(int16_t &x, const int16_t &y = 0)
     MF_DISPLAY.fillCircle(x + 50, y + 50, 23, FG_COLOR);
     x += 101;
 #endif
+} // }}}
+
+static void drawCenteredConnectionText(const char *text, const int16_t y,
+                                       const uint8_t textSize)
+{
+    const int16_t textWidth = 6 * textSize * strlen(text);
+    drawText(text, (MF_DISPLAY.width() - textWidth) / 2, y, textSize);
+}
+
+void drawConnectionScreen()
+{ // {{{
+    // Reuse the panel's existing mark as a large backdrop, leaving a strip at
+    // the top and bottom for the advertised Bluetooth name and connection state.
+    int16_t logoSize = MF_DISPLAY.height() - 72;
+    const int16_t widthLimit = MF_DISPLAY.width() - 24;
+    if (logoSize > widthLimit) {
+        logoSize = widthLimit;
+    }
+    const int16_t logoX = (MF_DISPLAY.width() - logoSize) / 2;
+    const int16_t logoY = (MF_DISPLAY.height() - logoSize) / 2;
+    const int16_t centerX = logoX + logoSize / 2;
+    const int16_t centerY = logoY + logoSize / 2;
+    uint16_t logoColor = FG_COLOR;
+    uint16_t centerColor = FG_COLOR;
+#if defined(INKTERFACE_LCD5B)
+    logoColor = LCD5B_MUTED_COLOR;
+    centerColor = LCD5B_ACCENT_COLOR;
+#endif
+
+    MF_DISPLAY.fillRoundRect(logoX, logoY, logoSize, logoSize, logoSize / 12, logoColor);
+    MF_DISPLAY.fillCircle(centerX, centerY, logoSize * 31 / 100, BG_COLOR);
+    MF_DISPLAY.fillCircle(centerX, centerY, logoSize * 23 / 100, centerColor);
+
+#if defined(INKTERFACE_LCD5B)
+    const uint8_t textSize = 3;
+    const int16_t nameY = 10;
+    const int16_t statusY = MF_DISPLAY.height() - 28;
+#else
+    const uint8_t textSize = 2;
+    const int16_t nameY = 10;
+    const int16_t statusY = MF_DISPLAY.height() - 28;
+#endif
+    drawCenteredConnectionText(BLE_NAME.c_str(), nameY, textSize);
+    drawCenteredConnectionText("Waiting for Steam Machine app", statusY, textSize);
 } // }}}
 
 void drawSparkbox(int16_t &x, const int16_t &y, std::string &title, const std::string &value,
@@ -1264,6 +1463,11 @@ void drawDiscreteBox(int16_t &x, const int16_t &y, const std::string &title,
 
 void drawStatic()
 { // {{{
+    if (!STATE.connected) {
+        drawConnectionScreen();
+        return;
+    }
+
     int16_t x = 0;
     int16_t y = 0;
 
